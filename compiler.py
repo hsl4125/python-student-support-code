@@ -110,16 +110,95 @@ class Compiler:
     # The expression e passed to select_arg should furthermore be an atom.
     # (But there is no type for atoms, so the type of e is given as expr.)
     def select_arg(self, e: expr) -> arg:
-        # YOUR CODE HERE
-        pass        
+        match e:
+            case Constant(value):
+                return Immediate(value)
+            case Name(id):
+                return Variable(id)
+            case _:
+                raise Exception('error in select_arg, unexpected ' + repr(e))
+
+    def select_exp(self, e: expr, target: arg | None) -> List[instr]:
+        match e:
+            case Constant(_) | Name(_):
+                if target is None:
+                    return []
+                src = self.select_arg(e)
+                if src == target:
+                    return []
+                return [Instr('movq', [src, target])]
+            case Call(Name('input_int'), []):
+                instrs = [Callq('read_int', 0)]
+                if target is not None:
+                    instrs.append(Instr('movq', [Reg('rax'), target]))
+                return instrs
+            case UnaryOp(USub(), atm):
+                if target is None:
+                    return []
+                src = self.select_arg(atm)
+                instrs = []
+                if src != target:
+                    instrs.append(Instr('movq', [src, target]))
+                instrs.append(Instr('negq', [target]))
+                return instrs
+            case BinOp(left, Add(), right):
+                if target is None:
+                    return []
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                if target == left_arg or target == right_arg:
+                    other = right_arg if target == left_arg else left_arg
+                    return [Instr('addq', [other, target])]
+                return [
+                    Instr('movq', [left_arg, target]),
+                    Instr('addq', [right_arg, target]),
+                ]
+            case BinOp(left, Sub(), right):
+                if target is None:
+                    return []
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                if target == right_arg and target != left_arg:
+                    return [
+                        Instr('movq', [left_arg, Reg('rax')]),
+                        Instr('subq', [right_arg, Reg('rax')]),
+                        Instr('movq', [Reg('rax'), target]),
+                    ]
+                instrs = []
+                if left_arg != target:
+                    instrs.append(Instr('movq', [left_arg, target]))
+                instrs.append(Instr('subq', [right_arg, target]))
+                return instrs
+            case _:
+                raise Exception('error in select_exp, unexpected ' + repr(e))
 
     def select_stmt(self, s: stmt) -> List[instr]:
-        # YOUR CODE HERE
-        pass        
+        Instrs = []
+        match s:
+            case Expr(Call(Name('print'), [exp])):
+                src = self.select_arg(exp)
+                mov = Instr('movq', [src, Reg('rdi')])
+                call = Callq('print_int', 1)
+                Instrs.append(mov)
+                Instrs.append(call)
+                return Instrs
+            case Expr(exp):
+                return self.select_exp(exp, None)
+            case Assign([Name(id)], exp):
+                return self.select_exp(exp, Variable(id))
+            case _:
+                raise Exception('error in select_stmt, unexpected ' + repr(s))
 
     def select_instructions(self, p: Module) -> X86Program:
-        # YOUR CODE HERE
-        pass        
+        match p:
+            case Module(body):
+                Instrs = []
+                for stmt in body:
+                    s = self.select_stmt(stmt)
+                    Instrs += s
+                return X86Program({'start' : Instrs})
+            case _:
+                raise Exception('error in select_instructions, unexpected ' + repr(p))
 
     ############################################################################
     # Assign Homes
