@@ -66,15 +66,10 @@ class Compiler:
                 stmts.append(stmt)
             return stmts
         match s:
-            case Expr(Call(Name('print'), exps)):
-                stmts = []
-                args = []
-                for exp in exps:
-                    (expr, temporaries) = self.rco_exp(exp, True)
-                    s = resolve_temporaries(temporaries)
-                    stmts += s
-                    args.append(expr)
-                call = Expr(Call(Name('print'), args))
+            case Expr(Call(Name('print'), [exp])):
+                (expr, temporaries) = self.rco_exp(exp, True)
+                stmts = resolve_temporaries(temporaries)
+                call = Expr(Call(Name('print'), [expr]))
                 stmts.append(call)
                 return stmts
             case Expr(exp):
