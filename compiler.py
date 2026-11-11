@@ -240,16 +240,20 @@ class Compiler:
                 stack_size += 8
             p.stack_size = stack_size
 
-        home = {}
-        for name, block in p.body.items():
-            instrs = []
-            for i in block:
-                newi = self.assign_homes_instr(i, home)
-                instrs.append(newi)
-            p.body[name] = instrs
+        match p:
+            case X86Program(body) if isinstance(body, dict):
+                home = {}
+                for name, block in body.items():
+                    instrs = []
+                    for i in block:
+                        newi = self.assign_homes_instr(i, home)
+                        instrs.append(newi)
+                    body[name] = instrs
 
-        set_stack_size()
-        return p
+                set_stack_size()
+                return p
+            case _:
+                raise Exception('error in assign_homes, unexpected ' + repr(p))
 
     ############################################################################
     # Patch Instructions
