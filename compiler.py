@@ -205,17 +205,51 @@ class Compiler:
     ############################################################################
 
     def assign_homes_arg(self, a: arg, home: Dict[Variable, arg]) -> arg:
-        # YOUR CODE HERE
-        pass        
+        match a:
+            case Variable(id) as k:
+                v = home.get(k)
+                if v != None:
+                    return v
+                else:
+                    size = len(home)
+                    offset = -8 * size - 8
+                    v = Deref('rbp', offset)
+                    home[k] = v
+                    return v
+            case _:
+                return a
 
     def assign_homes_instr(self, i: instr,
                            home: Dict[Variable, arg]) -> instr:
-        # YOUR CODE HERE
-        pass        
+        match i:
+            case  Instr(iname, [src, dst]) if iname in ['addq', 'subq', 'movq'] :
+                src = self.assign_homes_arg(src, home)
+                dst = self.assign_homes_arg(dst, home)
+                return Instr(iname, [src, dst])
+            case Instr(iname, [dst]) if iname in ['negq']:
+                dst = self.assign_homes_arg(dst, home)
+                return Instr(iname, [dst])
+            case _:
+                return i
 
     def assign_homes(self, p: X86Program) -> X86Program:
-        # YOUR CODE HERE
-        pass        
+        def set_stack_size():
+            size = len(home)
+            stack_size = size * 8
+            if stack_size % 16 != 0:
+                stack_size += 8
+            p.stack_size = stack_size
+
+        home = {}
+        for name, block in p.body.items():
+            instrs = []
+            for i in block:
+                newi = self.assign_homes_instr(i, home)
+                instrs.append(newi)
+            p.body[name] = instrs
+
+        set_stack_size()
+        return p
 
     ############################################################################
     # Patch Instructions
