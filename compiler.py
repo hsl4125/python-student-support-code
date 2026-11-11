@@ -264,9 +264,12 @@ class Compiler:
         MAX_INT32 = (1<<31)-1
         instrs = []
         match i:
-            case Instr('movq', [Deref(_) as src, Deref(_) as dst]):
+            case Instr('movq', [Deref(_) as src, Deref(_) as dst]) :
                 instrs.append(Instr('movq', [src, Reg('rax')]))
                 instrs.append(Instr('movq', [Reg('rax'), dst]))
+            case Instr(iname, [Deref(_) as src, Deref(_) as dst]) if iname in ['addq', 'subq']:
+                instrs.append(Instr('movq', [src, Reg('rax')]))
+                instrs.append(Instr(iname, [Reg('rax'), dst]))
             case Instr('movq', [Immediate(n), dst]) if not (MIN_INT32 <= n <= MAX_INT32):
                 instrs.append(Instr('movq', [Immediate(n), Reg('rax')]))
                 instrs.append(Instr('movq', [Reg('rax'), dst]))
