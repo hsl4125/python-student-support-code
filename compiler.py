@@ -12,6 +12,60 @@ Temporaries = List[Binding]
 class Compiler:
 
     ############################################################################
+    #  Partial Evaluator
+    ############################################################################
+
+    def pe_neg(self, e: expr) -> expr:
+        match e:
+            case Constant(n):
+                return Constant(neg64(n))
+            case _:
+                return UnaryOp(USub(), e)
+
+    def pe_add(self, l: expr, r: expr) -> expr:
+        match (l, r):
+            case (Constant(a), Constant(b)):
+                return Constant(add64(a, b))
+            case _:
+                return BinOp(l, Add(), r)
+
+    def pe_exp(self, e: expr) -> expr:
+        match e:
+            case UnaryOp(USub(), exp):
+                return self.pe_neg(self.pe_exp(exp))
+            case BinOp(l, Add(), r):
+                return self.pe_add(self.pe_exp(l), self.pe_exp(r))
+            case BinOp(l, Sub(), r):
+                return self.pe_add(self.pe_exp(l), self.pe_neg(self.pe_exp(r)))
+            case _:
+                #raise Exception('error in pe_exp, unexpected ' + repr(e))
+                return e
+
+    def pe_stmt(self, s: stmt) -> stmt:
+        match s:
+            case Expr(Call(Name('print'), [exp])):
+                e = self.pe_exp(exp)
+                return Expr(Call(Name('print'), [e]))
+            case Expr(exp):
+                return Expr(self.pe_exp(exp))
+            case Assign([Name(id)], exp):
+                e = self.pe_exp(exp)
+                return Assign([Name(id)], e)
+            case _:
+                #raise Exception('error in pe_stmt, unexpected ' + repr(s))
+                return s
+
+    def partial_eval(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                stmts = []
+                for stmt in body:
+                    stmts.append(self.pe_stmt(stmt))
+                return Module(stmts)
+            case _:
+                raise Exception('error in partial_eval, unexpected ' + repr(p))
+
+    ############################################################################
     # Remove Complex Operands
     ############################################################################
 
