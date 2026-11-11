@@ -196,7 +196,7 @@ class Compiler:
                 for stmt in body:
                     s = self.select_stmt(stmt)
                     Instrs += s
-                return X86Program({'start' : Instrs})
+                return X86Program({'main' : Instrs})
             case _:
                 raise Exception('error in select_instructions, unexpected ' + repr(p))
 
@@ -291,5 +291,29 @@ class Compiler:
     ############################################################################
 
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
-        # YOUR CODE HERE
-        pass        
+        def prelude(stack_size) -> List[instr]:
+            return [
+                Instr('pushq', [Reg('rbp')]),
+                Instr('movq', [Reg('rsp'), Reg('rbp')]),
+                Instr('subq', [Immediate(stack_size), Reg('rsp')])
+            ]
+
+        def conclusion(stack_size) -> List[instr]:
+            return [
+                Instr('addq', [Immediate(stack_size), Reg('rsp')]),
+                Instr('popq', [Reg('rbp')]),
+                Instr('retq', [])
+            ]
+
+        match p:
+            case X86Program(body):
+                instrs = body.get('main')
+                if instrs == None:
+                    raise Exception('error in prelude_and_conclusion, main block is empty')
+                main_instrs = prelude(p.stack_size)
+                main_instrs += instrs
+                main_instrs += conclusion(p.stack_size)
+                body['main'] = main_instrs
+                return p
+            case _:
+                raise Exception('error in prelude_and_conclusion, unexpected ' + repr(p))
