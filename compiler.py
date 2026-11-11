@@ -256,12 +256,31 @@ class Compiler:
     ############################################################################
 
     def patch_instr(self, i: instr) -> List[instr]:
-        # YOUR CODE HERE
-        pass        
+        MIN_INT32 = -(1<<31)
+        MAX_INT32 = (1<<31)-1
+        instrs = []
+        match i:
+            case Instr('movq', [Deref(_) as src, Deref(_) as dst]):
+                instrs.append(Instr('movq', [src, Reg('rax')]))
+                instrs.append(Instr('movq', [Reg('rax'), dst]))
+            case Instr('movq', [Immediate(n), dst]) if not (MIN_INT32 <= n <= MAX_INT32):
+                instrs.append(Instr('movq', [Immediate(n), Reg('rax')]))
+                instrs.append(Instr('movq', [Reg('rax'), dst]))
+            case _:
+                instrs.append(i)
+        return instrs
 
     def patch_instructions(self, p: X86Program) -> X86Program:
-        # YOUR CODE HERE
-        pass        
+        match p:
+            case X86Program(body):
+                for name, block in body.items():
+                    instrs = []
+                    for i in block:
+                        instrs += self.patch_instr(i)
+                    body[name] = instrs
+                return p
+            case _:
+                raise Exception('error in patch_instructions, unexpected ' + repr(p))
 
     ############################################################################
     # Prelude & Conclusion
