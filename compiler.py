@@ -11,8 +11,9 @@ Temporaries = List[Binding]
 
 class Compiler:
 
+    """
     ############################################################################
-    #  Partial Evaluator
+    #  Partial Evaluator (old)
     ############################################################################
 
     def pe_neg(self, e: expr) -> expr:
@@ -37,6 +38,74 @@ class Compiler:
                 return self.pe_add(self.pe_exp(l), self.pe_exp(r))
             case BinOp(l, Sub(), r):
                 return self.pe_add(self.pe_exp(l), self.pe_neg(self.pe_exp(r)))
+            case _:
+                #raise Exception('error in pe_exp, unexpected ' + repr(e))
+                return e
+
+    def pe_stmt(self, s: stmt) -> stmt:
+        match s:
+            case Expr(Call(Name('print'), [exp])):
+                e = self.pe_exp(exp)
+                return Expr(Call(Name('print'), [e]))
+            case Expr(exp):
+                return Expr(self.pe_exp(exp))
+            case Assign([Name(id)], exp):
+                e = self.pe_exp(exp)
+                return Assign([Name(id)], e)
+            case _:
+                #raise Exception('error in pe_stmt, unexpected ' + repr(s))
+                return s
+
+    def partial_eval(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                stmts = []
+                for stmt in body:
+                    stmts.append(self.pe_stmt(stmt))
+                return Module(stmts)
+            case _:
+                raise Exception('error in partial_eval_old, unexpected ' + repr(p))
+    """
+
+    ############################################################################
+    #  Partial Evaluator
+    ############################################################################
+
+    def residual(self, e: expr) -> expr:
+        match e:
+            case BinOp(l, Add(), Constant(n)):
+                return BinOp(Constant(n), Add(), self.residual(l))
+            case BinOp(l, Sub(), r):
+                return BinOp(self.residual(l), Add(), UnaryOp(USub(), self.residual(r)))
+            case UnaryOp(USub(), exp):
+                return UnaryOp(USub(), self.residual(exp))
+            case _:
+                return e
+
+    def pe_neg(self, e: expr) -> expr:
+        match e:
+            case Constant(n):
+                return Constant(neg64(n))
+            case _:
+                return UnaryOp(USub(), e)
+
+    def pe_add(self, l: expr, r: expr) -> expr:
+        match (l, r):
+            case (Constant(a), Constant(b)):
+                return Constant(add64(a, b))
+            case (Constant(a), BinOp(Constant(b), Add(), rest)):
+                return self.pe_add(Constant(add64(a, b)), rest)
+            case _:
+                return BinOp(l, Add(), r)
+
+    def pe_exp(self, e: expr) -> expr:
+        match e:
+            case UnaryOp(USub(), exp):
+                return self.pe_neg(self.residual(exp))
+            case BinOp(l, Add(), r):
+                return self.pe_add(self.residual(l), self.residual(r))
+            case BinOp(l, Sub(), r):
+                return self.pe_add(self.residual(l), self.pe_neg(self.residual(r)))
             case _:
                 #raise Exception('error in pe_exp, unexpected ' + repr(e))
                 return e
