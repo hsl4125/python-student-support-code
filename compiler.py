@@ -373,6 +373,84 @@ class Compiler:
             case _:
                 raise Exception('error in assign_homes, unexpected ' + repr(p))
 
+    # Liveness Analysis
+    # Lafter(k) = Lbefore(k + 1)
+    # Lafter(n) = ∅  (last instruction)
+    # Lbefore(k) = (Lafter(k) − W(k)) ∪ R(k)
+    # R(K): read instruction I(k)
+    # W(K): write instruction I(k)
+    def uncover_live(self, s: List[instr]) -> dict[instr, set[location]]:
+        def operand_locations(l: arg) -> set[location]:
+            match l:
+                case Variable(id): return {l}
+                case Reg(r): return {l}
+                case Deref(reg, offset): return {Reg(reg)}
+                case _ : return set()
+
+        def written_locations(l: arg) -> set[location]:
+            match l:
+                case Variable(id): return {l}
+                case Reg(r): return {l}
+                case _ : return set()
+
+        def address_base_locations(l: arg) -> set[location]:
+            match l:
+                case Deref(reg, _): return {Reg(reg)}
+                case _ : return set()
+
+        def R(i: instr) -> set[location]:
+            match i:
+                case Instr(iname, [src, dst]) if iname in ['addq', 'subq']:
+                    return operand_locations(src) | operand_locations(dst)
+                case Instr('movq', [src, dst]):
+                    return operand_locations(src) | address_base_locations(dst)
+                case Instr('negq', [dst]):
+                    return operand_locations(dst)
+                case Instr('pushq', [src]):
+                    return {Reg('rsp')} | operand_locations(src)
+                case Instr('popq', [dst]):
+                    return {Reg('rsp')} | address_base_locations(dst)
+                case Callq(_, n):
+                    passed = [Reg('rdi'), Reg('rsi'), Reg('rdx'), Reg('rcx'), Reg('r8'), Reg('r9')]
+                    return set(passed[:n])
+                case Instr('retq', []):
+                    return {Reg('rsp')}
+                case _:
+                    return set()
+
+        def W(i: instr) -> set[location]:
+            match i:
+                case Instr(iname, [_, dst]) if iname in ['addq', 'subq']:
+                    return written_locations(dst)
+                case Instr('movq', [_, dst]):
+                    return written_locations(dst)
+                case Instr('negq', [dst]):
+                    return written_locations(dst)
+                case Instr('pushq', [dst]):
+                    return {Reg('rsp')}
+                case Instr('popq', [dst]):
+                    return {Reg('rsp')} | written_locations(dst)
+                case Callq(_, _):
+                    rs = [Reg('rax'), Reg('rcx'), Reg('rdx'), Reg('rsi'), Reg('rdi'), Reg('r8'), Reg('r9'), Reg('r10'), Reg('r11')]
+                    return set(rs)
+                case Instr('retq', []):
+                    return {Reg('rsp')}
+                case _:
+                    return set()
+
+        live_after = {}
+        if not s:
+            return live_after
+        after_i = set()
+        before_i = set()
+
+        for i in reversed(s):
+            before_i = after_i.difference(W(i)) | R(i)
+            live_after[i] = after_i
+            after_i = before_i
+        
+        return live_after
+
     ############################################################################
     # Patch Instructions
     ############################################################################
