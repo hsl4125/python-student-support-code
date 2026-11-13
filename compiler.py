@@ -4,6 +4,7 @@ from utils import *
 from x86_ast import *
 import os
 from typing import List, Tuple, Set, Dict
+from graph import *
 
 Binding = Tuple[Name, expr]
 Temporaries = List[Binding]
@@ -373,6 +374,64 @@ class Compiler:
             case _:
                 raise Exception('error in assign_homes, unexpected ' + repr(p))
 
+    def operand_locations(self, l: arg) -> set[location]:
+        match l:
+            case Variable(id): return {l}
+            case Reg(r): return {l}
+            case Deref(reg, offset): return {Reg(reg)}
+            case _ : return set()
+
+    def written_locations(self, l: arg) -> set[location]:
+        match l:
+            case Variable(id): return {l}
+            case Reg(r): return {l}
+            case _ : return set()
+
+    def address_base_locations(self, l: arg) -> set[location]:
+        match l:
+            case Deref(reg, _): return {Reg(reg)}
+            case _ : return set()
+
+    def R(self, i: instr) -> set[location]:
+        match i:
+            case Instr(iname, [src, dst]) if iname in ['addq', 'subq']:
+                return self.operand_locations(src) | self.operand_locations(dst)
+            case Instr('movq', [src, dst]):
+                return self.operand_locations(src) | self.address_base_locations(dst)
+            case Instr('negq', [dst]):
+                return self.operand_locations(dst)
+            case Instr('pushq', [src]):
+                return {Reg('rsp')} | self.operand_locations(src)
+            case Instr('popq', [dst]):
+                return {Reg('rsp')} | self.address_base_locations(dst)
+            case Callq(_, n):
+                passed = [Reg('rdi'), Reg('rsi'), Reg('rdx'), Reg('rcx'), Reg('r8'), Reg('r9')]
+                return set(passed[:n])
+            case Instr('retq', []):
+                return {Reg('rsp')}
+            case _:
+                return set()
+
+    def W(self, i: instr) -> set[location]:
+        match i:
+            case Instr(iname, [_, dst]) if iname in ['addq', 'subq']:
+                return self.written_locations(dst)
+            case Instr('movq', [_, dst]):
+                return self.written_locations(dst)
+            case Instr('negq', [dst]):
+                return self.written_locations(dst)
+            case Instr('pushq', [dst]):
+                return {Reg('rsp')}
+            case Instr('popq', [dst]):
+                return {Reg('rsp')} | self.written_locations(dst)
+            case Callq(_, _):
+                rs = [Reg('rax'), Reg('rcx'), Reg('rdx'), Reg('rsi'), Reg('rdi'), Reg('r8'), Reg('r9'), Reg('r10'), Reg('r11')]
+                return set(rs)
+            case Instr('retq', []):
+                return {Reg('rsp')}
+            case _:
+                return set()
+
     # Liveness Analysis
     # Lafter(k) = Lbefore(k + 1)
     # Lafter(n) = ∅  (last instruction)
@@ -380,64 +439,6 @@ class Compiler:
     # R(K): read instruction I(k)
     # W(K): write instruction I(k)
     def uncover_live(self, s: List[instr]) -> dict[instr, set[location]]:
-        def operand_locations(l: arg) -> set[location]:
-            match l:
-                case Variable(id): return {l}
-                case Reg(r): return {l}
-                case Deref(reg, offset): return {Reg(reg)}
-                case _ : return set()
-
-        def written_locations(l: arg) -> set[location]:
-            match l:
-                case Variable(id): return {l}
-                case Reg(r): return {l}
-                case _ : return set()
-
-        def address_base_locations(l: arg) -> set[location]:
-            match l:
-                case Deref(reg, _): return {Reg(reg)}
-                case _ : return set()
-
-        def R(i: instr) -> set[location]:
-            match i:
-                case Instr(iname, [src, dst]) if iname in ['addq', 'subq']:
-                    return operand_locations(src) | operand_locations(dst)
-                case Instr('movq', [src, dst]):
-                    return operand_locations(src) | address_base_locations(dst)
-                case Instr('negq', [dst]):
-                    return operand_locations(dst)
-                case Instr('pushq', [src]):
-                    return {Reg('rsp')} | operand_locations(src)
-                case Instr('popq', [dst]):
-                    return {Reg('rsp')} | address_base_locations(dst)
-                case Callq(_, n):
-                    passed = [Reg('rdi'), Reg('rsi'), Reg('rdx'), Reg('rcx'), Reg('r8'), Reg('r9')]
-                    return set(passed[:n])
-                case Instr('retq', []):
-                    return {Reg('rsp')}
-                case _:
-                    return set()
-
-        def W(i: instr) -> set[location]:
-            match i:
-                case Instr(iname, [_, dst]) if iname in ['addq', 'subq']:
-                    return written_locations(dst)
-                case Instr('movq', [_, dst]):
-                    return written_locations(dst)
-                case Instr('negq', [dst]):
-                    return written_locations(dst)
-                case Instr('pushq', [dst]):
-                    return {Reg('rsp')}
-                case Instr('popq', [dst]):
-                    return {Reg('rsp')} | written_locations(dst)
-                case Callq(_, _):
-                    rs = [Reg('rax'), Reg('rcx'), Reg('rdx'), Reg('rsi'), Reg('rdi'), Reg('r8'), Reg('r9'), Reg('r10'), Reg('r11')]
-                    return set(rs)
-                case Instr('retq', []):
-                    return {Reg('rsp')}
-                case _:
-                    return set()
-
         live_after = {}
         if not s:
             return live_after
@@ -445,11 +446,43 @@ class Compiler:
         before_i = set()
 
         for i in reversed(s):
-            before_i = after_i.difference(W(i)) | R(i)
+            before_i = after_i.difference(self.W(i)) | self.R(i)
             live_after[i] = after_i
             after_i = before_i
         
         return live_after
+
+    # build_interference
+    # 1. If instruction Ik is a move instruction of the form movq s, d, then for every
+    #    v ∈ Lafter(k), if v ̸= d and v ̸= s, add the edge (d, v).
+    #    notice：d ∈ W(k) (Write), s is src(exlcude Deref, only include Reg and Variable)
+    # 2. For any other instruction Ik, for every d ∈ W(k) and every v∈ Lafter(k), if v ̸= d, add
+    #    the edge (d, v).
+    def build_interference(self, live_after: dict[instr, set[location]]) -> UndirectedAdjList:
+        g = UndirectedAdjList()
+        def add_edge(u, v):
+            if not g.has_edge(u, v):
+                g.add_edge(u, v)
+
+        for i, lafter in live_after.items():
+            # vertex
+            for vertex in self.W(i) | self.R(i):
+                g.add_vertex(vertex)
+
+            # edge
+            w = self.W(i)
+            match i:
+                case Instr('movq', [src, _]):
+                    for d in w:
+                        for v in lafter:
+                            if v not in (src, d):
+                                add_edge(d, v)
+                case _:
+                    for d in w:
+                        for v in lafter:
+                            if d != v:
+                                add_edge(d, v)
+        return g
 
     ############################################################################
     # Patch Instructions
