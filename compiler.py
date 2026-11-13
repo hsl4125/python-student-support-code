@@ -456,6 +456,8 @@ class Compiler:
     # 1. If instruction Ik is a move instruction of the form movq s, d, then for every
     #    v ∈ Lafter(k), if v ̸= d and v ̸= s, add the edge (d, v).
     #    notice：d ∈ W(k) (Write), s is src(exlcude Deref, only include Reg and Variable)
+    #    Compared with 2, src needs to be excluded, only this one difference.
+    #
     # 2. For any other instruction Ik, for every d ∈ W(k) and every v∈ Lafter(k), if v ̸= d, add
     #    the edge (d, v).
     def build_interference(self, live_after: dict[instr, set[location]]) -> UndirectedAdjList:
