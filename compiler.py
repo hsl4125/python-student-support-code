@@ -322,7 +322,7 @@ class Compiler:
     ############################################################################
     # Assign Homes
     ############################################################################
-
+    '''
     def assign_homes_arg(self, a: arg, home: Dict[Variable, arg]) -> arg:
         match a:
             case Variable(id) as k:
@@ -373,7 +373,7 @@ class Compiler:
                 return p
             case _:
                 raise Exception('error in assign_homes, unexpected ' + repr(p))
-
+    '''
     def operand_locations(self, l: arg) -> set[location]:
         match l:
             case Variable(id): return {l}
@@ -485,7 +485,7 @@ class Compiler:
         g = UndirectedAdjList()
 
         # init vertexs
-        for vertex in self.all_home_vars(homes):
+        for vertex in homes:
             g.add_vertex(vertex)
 
         def add_edge(u, v):
@@ -506,6 +506,144 @@ class Compiler:
                             if d != v:
                                 add_edge(d, v)
         return g
+
+    # Graph Coloring
+    # saturation(u) = {c | ∃v.v∈ adjacent(u) and color(v) = c}
+    # Algorithm: DSATUR
+    # Input: A graph G
+    # Output: An assignment color[v] for each vertex v ∈ G
+    # 
+    # W ←vertices(G)
+    # while W ̸= ∅ do
+    #   pick a vertex u from W with the highest saturation,
+    #       breaking ties randomly
+    #   find the lowest color c that is not in {color[v] : v ∈ adjacent(u)}
+    #   color[u] ←c
+    #   add color c to the saturation for the neighboring vertices
+    #   W ←W − {u}
+    def allocate_registers(self, g: UndirectedAdjList) -> dict[Variable, arg]:
+        w = [v for v in g.vertices() if isinstance(v, Variable)]
+        if not w:
+            return {}
+        homes : dict[Variable, arg] = {}
+        colors : dict[Variable, int] = {}
+        saturations : dict[Variable, set[int]] = {}
+        for v in w:
+            saturations[v] = set()
+
+        def pick_vertex() -> Variable:
+            max = w[0]
+            for v in w:
+                if len(saturations.get(v)) > len(saturations.get(max)):
+                    max = v
+            return max
+
+        def get_color(u):
+            used_colors = saturations[u]
+            color = 0
+            while color in used_colors:
+                color += 1
+            return color
+
+        def color_to_location(c) -> arg:
+            match c:
+                case -5: return Reg('r15')
+                case -4: return Reg('r11')
+                case -3: return Reg('rbp')
+                case -2: return Reg('rsp')
+                case -1: return Reg('rax')
+
+                case 0: return Reg('rcx')
+                case 1: return Reg('rdx')
+                case 2: return Reg('rsi')
+                case 3: return Reg('rdi')
+                case 4: return Reg('r8')
+                case 5: return Reg('r9')
+                case 6: return Reg('r10')
+                case 7: return Reg('rbx')
+                case 8: return Reg('r12')
+                case 9: return Reg('r13')
+                case 10: return Reg('r14')
+                case n if n > 10:
+                    return Deref('rbp', (n - 10) * -8)
+                case _:
+                    raise Exception('error in color_to_location, unexpected ' + repr(c))
+
+        register_colors = {}
+        for color in range(-5, 11):
+            register_colors[color_to_location(color)] = color
+
+        def precolor_register_neighbors():
+            for variable in w:
+                for neighbor in g.adjacent(variable):
+                    if isinstance(neighbor, Reg):
+                        if neighbor not in register_colors:
+                            raise ValueError(f'no register color defined for {neighbor}')
+                        saturations[variable].add(register_colors[neighbor])
+
+        precolor_register_neighbors()
+
+        def add_saturation_to_neighbor(u, c):
+            neighbors = g.adjacent(u)
+            for n in neighbors:
+                if isinstance(n, Variable):
+                    saturations[n].add(c)
+
+        while w:
+            u = pick_vertex()
+            c = get_color(u)
+            colors[u] = c
+            add_saturation_to_neighbor(u, c)
+            w.remove(u)
+            homes[u] = color_to_location(c)
+        return homes
+
+    # TODO: multi block
+    def assign_homes(self, p: X86Program) -> X86Program:
+        match p:
+            case X86Program(body) if isinstance(body, dict):
+                if set(body) != {'main'}:
+                    raise ValueError(
+                        "assign_homes currently supports only a single 'main' block")
+
+                instructions = body['main']
+                homes = self.all_home_vars(instructions)
+                live_after = self.uncover_live(instructions)
+
+                interference = self.build_interference(
+                    homes, live_after)
+                home = self.allocate_registers(interference)
+
+                def assign_arg(a: arg) -> arg:
+                    if isinstance(a, Variable):
+                        if a not in home:
+                            raise KeyError(f'no home assigned to {a}')
+                        return home[a]
+                    return a
+
+                def assign_instr(i: instr) -> instr:
+                    match i:
+                        case Instr(name, args):
+                            return Instr(name, [assign_arg(a) for a in args])
+                        case _:
+                            return i
+
+                body['main'] = [assign_instr(i) for i in instructions]
+
+                stack_size = max(
+                    (
+                        -location.offset
+                        for location in home.values()
+                        if isinstance(location, Deref)
+                        and location.reg == 'rbp'
+                        and location.offset < 0
+                    ),
+                    default=0,
+                )
+                p.stack_size = (stack_size + 15) // 16 * 16
+                return p
+            case _:
+                raise Exception('error in assign_homes, unexpected ' + repr(p))
 
     ############################################################################
     # Patch Instructions
