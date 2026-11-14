@@ -1,0 +1,5 @@
+a = input_int()
+b = input_int()
+c = input_int()
+d = input_int()
+print(a + b + c + d)

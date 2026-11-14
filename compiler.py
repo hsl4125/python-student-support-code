@@ -414,8 +414,10 @@ class Compiler:
     #   color[u] ←c
     #   add color c to the saturation for the neighboring vertices
     #   W ←W − {u}
-    def allocate_registers(self, g: UndirectedAdjList) -> dict[Variable, arg]:
+    def allocate_registers(self, g: UndirectedAdjList,
+                           p: X86Program) -> dict[Variable, arg]:
         w = [v for v in g.vertices() if isinstance(v, Variable)]
+        p.used_callee = []
         if not w:
             return {}
         homes : dict[Variable, arg] = {}
@@ -489,6 +491,21 @@ class Compiler:
             add_saturation_to_neighbor(u, c)
             w.remove(u)
             homes[u] = color_to_location(c)
+
+        # set used_callee
+        callee_saved = [
+            Reg('rbx'), Reg('r12'), Reg('r13'), Reg('r14'), Reg('r15')
+        ]
+        for r in homes.values():
+            if r in callee_saved:
+                if r not in p.used_callee:
+                    p.used_callee.append(r)
+
+        # spill variable resize offset: add used_callee size
+        spill_offset = len(p.used_callee) * 8
+        for variable, home in homes.items():
+            if isinstance(home, Deref) and home.reg == 'rbp' and home.offset < 0:
+                homes[variable] = Deref('rbp', home.offset - spill_offset)
         return homes
 
     # TODO: multi block
@@ -505,7 +522,7 @@ class Compiler:
 
                 interference = self.build_interference(
                     homes, live_after)
-                home = self.allocate_registers(interference)
+                home = self.allocate_registers(interference, p)
 
                 def assign_arg(a: arg) -> arg:
                     if isinstance(a, Variable):
@@ -523,17 +540,23 @@ class Compiler:
 
                 body['main'] = [assign_instr(i) for i in instructions]
 
-                stack_size = max(
-                    (
-                        -location.offset
-                        for location in home.values()
-                        if isinstance(location, Deref)
-                        and location.reg == 'rbp'
-                        and location.offset < 0
-                    ),
-                    default=0,
-                )
-                p.stack_size = (stack_size + 15) // 16 * 16
+                def align16(n):
+                    assert(n % 8 == 0)
+                    if n % 16 == 0:
+                        return n
+                    else:
+                        return n + 8
+
+                # stack_size = align(8S + 8C) - 8C
+                spill_locations = {
+                    location for location in home.values()
+                    if isinstance(location, Deref)
+                    and location.reg == 'rbp'
+                }    
+                s = len(spill_locations)
+                c = len(p.used_callee)
+                p.stack_size = align16((s + c) * 8) - (8 * c)
+
                 return p
             case _:
                 raise Exception('error in assign_homes, unexpected ' + repr(p))
@@ -579,19 +602,26 @@ class Compiler:
     ############################################################################
 
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
+        used_callee = p.used_callee
+
         def prelude(stack_size) -> List[instr]:
-            return [
+            instrs = [
                 Instr('pushq', [Reg('rbp')]),
                 Instr('movq', [Reg('rsp'), Reg('rbp')]),
-                Instr('subq', [Immediate(stack_size), Reg('rsp')])
             ]
+            instrs.extend(Instr('pushq', [reg]) for reg in used_callee)
+            instrs.append(Instr('subq', [Immediate(stack_size), Reg('rsp')]))
+            return instrs
 
         def conclusion(stack_size) -> List[instr]:
-            return [
-                Instr('addq', [Immediate(stack_size), Reg('rsp')]),
+            instrs = [Instr('addq', [Immediate(stack_size), Reg('rsp')])]
+            instrs.extend(
+                Instr('popq', [reg]) for reg in reversed(used_callee))
+            instrs.extend([
                 Instr('popq', [Reg('rbp')]),
-                Instr('retq', [])
-            ]
+                Instr('retq', []),
+            ])
+            return instrs
 
         match p:
             case X86Program(body):

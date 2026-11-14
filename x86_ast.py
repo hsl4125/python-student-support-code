@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 from utils import dedent, indent, indent_stmt, label_name
@@ -10,6 +10,8 @@ from utils import dedent, indent, indent_stmt, label_name
 @dataclass
 class X86Program:
     body: dict[str, list[instr]] | list[instr]
+    stack_size: int = 0
+    used_callee: list[Reg] = field(default_factory=list)
 
     def __str__(self):
         result = ''
