@@ -654,6 +654,8 @@ class Compiler:
         MAX_INT32 = (1<<31)-1
         instrs = []
         match i:
+            case Instr('movq', [src, dst]) if src == dst:
+                return instrs
             case Instr('movq', [Deref() as src, Deref() as dst]) :
                 instrs.append(Instr('movq', [src, Reg('rax')]))
                 instrs.append(Instr('movq', [Reg('rax'), dst]))
