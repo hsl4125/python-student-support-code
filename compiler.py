@@ -452,6 +452,27 @@ class Compiler:
         
         return live_after
 
+    def all_home_vars(self, s: List[instr]) -> List[Variable]:
+        home_vars = []
+        seen = set()
+        for i in s:
+            match i:
+                case Instr(_, args):
+                    operands = args
+                #case IndirectCallq(func, _):
+                #    operands = (func,)
+                #case IndirectJump(target):
+                #    operands = (target,)
+                #case TailJump(func, _):
+                #    operands = (func,)
+                case _:
+                    operands = ()
+            for operand in operands:
+                if isinstance(operand, Variable) and operand not in seen:
+                    seen.add(operand)
+                    home_vars.append(operand)
+        return home_vars
+
     # build_interference
     # 1. If instruction Ik is a move instruction of the form movq s, d, then for every
     #    v ∈ Lafter(k), if v ̸= d and v ̸= s, add the edge (d, v).
@@ -460,18 +481,18 @@ class Compiler:
     #
     # 2. For any other instruction Ik, for every d ∈ W(k) and every v∈ Lafter(k), if v ̸= d, add
     #    the edge (d, v).
-    def build_interference(self, live_after: dict[instr, set[location]]) -> UndirectedAdjList:
+    def build_interference(self, homes: List[Variable], live_after: dict[instr, set[location]]) -> UndirectedAdjList:
         g = UndirectedAdjList()
+
+        # init vertexs
+        for vertex in self.all_home_vars(homes):
+            g.add_vertex(vertex)
+
         def add_edge(u, v):
             if not g.has_edge(u, v):
                 g.add_edge(u, v)
 
         for i, lafter in live_after.items():
-            # vertex
-            for vertex in self.W(i) | self.R(i):
-                g.add_vertex(vertex)
-
-            # edge
             w = self.W(i)
             match i:
                 case Instr('movq', [src, _]):
