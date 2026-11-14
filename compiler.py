@@ -12,62 +12,6 @@ Temporaries = List[Binding]
 
 class Compiler:
 
-    """
-    ############################################################################
-    #  Partial Evaluator (old)
-    ############################################################################
-
-    def pe_neg(self, e: expr) -> expr:
-        match e:
-            case Constant(n):
-                return Constant(neg64(n))
-            case _:
-                return UnaryOp(USub(), e)
-
-    def pe_add(self, l: expr, r: expr) -> expr:
-        match (l, r):
-            case (Constant(a), Constant(b)):
-                return Constant(add64(a, b))
-            case _:
-                return BinOp(l, Add(), r)
-
-    def pe_exp(self, e: expr) -> expr:
-        match e:
-            case UnaryOp(USub(), exp):
-                return self.pe_neg(self.pe_exp(exp))
-            case BinOp(l, Add(), r):
-                return self.pe_add(self.pe_exp(l), self.pe_exp(r))
-            case BinOp(l, Sub(), r):
-                return self.pe_add(self.pe_exp(l), self.pe_neg(self.pe_exp(r)))
-            case _:
-                #raise Exception('error in pe_exp, unexpected ' + repr(e))
-                return e
-
-    def pe_stmt(self, s: stmt) -> stmt:
-        match s:
-            case Expr(Call(Name('print'), [exp])):
-                e = self.pe_exp(exp)
-                return Expr(Call(Name('print'), [e]))
-            case Expr(exp):
-                return Expr(self.pe_exp(exp))
-            case Assign([Name(id)], exp):
-                e = self.pe_exp(exp)
-                return Assign([Name(id)], e)
-            case _:
-                #raise Exception('error in pe_stmt, unexpected ' + repr(s))
-                return s
-
-    def partial_eval(self, p: Module) -> Module:
-        match p:
-            case Module(body):
-                stmts = []
-                for stmt in body:
-                    stmts.append(self.pe_stmt(stmt))
-                return Module(stmts)
-            case _:
-                raise Exception('error in partial_eval_old, unexpected ' + repr(p))
-    """
-
     ############################################################################
     #  Partial Evaluator
     ############################################################################
@@ -322,58 +266,7 @@ class Compiler:
     ############################################################################
     # Assign Homes
     ############################################################################
-    '''
-    def assign_homes_arg(self, a: arg, home: Dict[Variable, arg]) -> arg:
-        match a:
-            case Variable(id) as k:
-                v = home.get(k)
-                if v != None:
-                    return v
-                else:
-                    size = len(home)
-                    offset = -8 * size - 8
-                    v = Deref('rbp', offset)
-                    home[k] = v
-                    return v
-            case _:
-                return a
 
-    def assign_homes_instr(self, i: instr,
-                           home: Dict[Variable, arg]) -> instr:
-        match i:
-            case  Instr(iname, [src, dst]) if iname in ['addq', 'subq', 'movq'] :
-                src = self.assign_homes_arg(src, home)
-                dst = self.assign_homes_arg(dst, home)
-                return Instr(iname, [src, dst])
-            case Instr(iname, [dst]) if iname in ['negq']:
-                dst = self.assign_homes_arg(dst, home)
-                return Instr(iname, [dst])
-            case _:
-                return i
-
-    def assign_homes(self, p: X86Program) -> X86Program:
-        def set_stack_size():
-            size = len(home)
-            stack_size = size * 8
-            if stack_size % 16 != 0:
-                stack_size += 8
-            p.stack_size = stack_size
-
-        match p:
-            case X86Program(body) if isinstance(body, dict):
-                home = {}
-                for name, block in body.items():
-                    instrs = []
-                    for i in block:
-                        newi = self.assign_homes_instr(i, home)
-                        instrs.append(newi)
-                    body[name] = instrs
-
-                set_stack_size()
-                return p
-            case _:
-                raise Exception('error in assign_homes, unexpected ' + repr(p))
-    '''
     def operand_locations(self, l: arg) -> set[location]:
         match l:
             case Variable(id): return {l}
