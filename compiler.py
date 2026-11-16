@@ -400,6 +400,19 @@ class Compiler:
                                 add_edge(d, v)
         return g
 
+    def move_related_graph(self, homes: List[Variable], s: List[instr]) -> UndirectedAdjList:
+        g = UndirectedAdjList()
+        for variable in homes:
+            g.add_vertex(variable)
+
+        for instruction in s:
+            match instruction:
+                case Instr('movq', [Variable() as src, Variable() as dst]):
+                    if src != dst and not g.has_edge(src, dst):
+                        g.add_edge(src, dst)
+
+        return g
+
     # Graph Coloring
     # saturation(u) = {c | ∃v.v∈ adjacent(u) and color(v) = c}
     # Algorithm: DSATUR
@@ -414,7 +427,14 @@ class Compiler:
     #   color[u] ←c
     #   add color c to the saturation for the neighboring vertices
     #   W ←W − {u}
+
+    #   Move Biasing
+    #   build move related graph
+    #   Among the candidate variables with the same saturation level,
+    #   the ones that have a movement relationship with the already colored
+    #   vertices and can use the color of that vertex are given priority.
     def allocate_registers(self, g: UndirectedAdjList,
+                           move_graph: UndirectedAdjList,
                            p: X86Program) -> dict[Variable, arg]:
         w = [v for v in g.vertices() if isinstance(v, Variable)]
         p.used_callee = []
@@ -426,19 +446,39 @@ class Compiler:
         for v in w:
             saturations[v] = set()
 
-        def pick_vertex() -> Variable:
-            max = w[0]
-            for v in w:
-                if len(saturations.get(v)) > len(saturations.get(max)):
-                    max = v
-            return max
+        def available_move_colors(u: Variable) -> set[int]:
+            return {
+                colors[neighbor]
+                for neighbor in move_graph.adjacent(u)
+                if neighbor in colors and colors[neighbor] not in saturations[u]
+            }
 
-        def get_color(u):
+        def lowest_available_color(u: Variable) -> int:
             used_colors = saturations[u]
             color = 0
             while color in used_colors:
                 color += 1
             return color
+
+        def choose_vertex_and_color() -> Tuple[Variable, int]:
+            max_saturation = max(len(saturations[v]) for v in w)
+            candidates = [
+                v for v in w if len(saturations[v]) == max_saturation
+            ]
+
+            for v in candidates:
+                color = lowest_available_color(v)
+                is_register_color = 0 <= color <= 10
+                move_colors = {
+                    c for c in available_move_colors(v)
+                    if (0 <= c <= 10) == is_register_color
+                }
+
+                if move_colors:
+                    return v, min(move_colors)
+
+            u = candidates[0]
+            return u, lowest_available_color(u)
 
         def color_to_location(c) -> arg:
             match c:
@@ -485,8 +525,7 @@ class Compiler:
                     saturations[n].add(c)
 
         while w:
-            u = pick_vertex()
-            c = get_color(u)
+            u, c = choose_vertex_and_color()
             colors[u] = c
             add_saturation_to_neighbor(u, c)
             w.remove(u)
@@ -522,7 +561,8 @@ class Compiler:
 
                 interference = self.build_interference(
                     homes, live_after)
-                home = self.allocate_registers(interference, p)
+                move_graph = self.move_related_graph(homes, instructions)
+                home = self.allocate_registers(interference, move_graph, p)
 
                 def assign_arg(a: arg) -> arg:
                     if isinstance(a, Variable):
@@ -552,7 +592,7 @@ class Compiler:
                     location for location in home.values()
                     if isinstance(location, Deref)
                     and location.reg == 'rbp'
-                }    
+                }
                 s = len(spill_locations)
                 c = len(p.used_callee)
                 p.stack_size = align16((s + c) * 8) - (8 * c)
