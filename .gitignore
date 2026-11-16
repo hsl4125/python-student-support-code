@@ -1,5 +1,5 @@
 **/__pycache__/
 /runtime.o
-tests/var/*.out
-tests/var/*.s
+/tests/*/*.out
+/tests/*/*.s
 /a.out
