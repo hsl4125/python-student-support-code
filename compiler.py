@@ -80,6 +80,57 @@ class Compiler:
                 raise Exception('error in partial_eval, unexpected ' + repr(p))
 
     ############################################################################
+    # Shrink
+    ############################################################################
+    def shrink_exp(self, e: expr) -> expr:
+        match  e:
+            case BoolOp(And(),[e1, e2]):
+                return IfExp(self.shrink_exp(e1), self.shrink_exp(e2), Constant(False))
+            case BoolOp(Or(),[e1, e2]):
+                return IfExp(self.shrink_exp(e1), Constant(True), self.shrink_exp(e2))
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.shrink_exp(operand))
+            case BinOp(left, op, right):
+                return BinOp(self.shrink_exp(left), op, self.shrink_exp(right))
+            case Compare(left, ops, comparators):
+                return Compare(self.shrink_exp(left), ops,
+                               [self.shrink_exp(comparator) for comparator in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(self.shrink_exp(test), self.shrink_exp(body),
+                             self.shrink_exp(orelse))
+            case Call(func, args):
+                return Call(self.shrink_exp(func),
+                            [self.shrink_exp(arg) for arg in args])
+            case Constant(_) | Name(_):
+                return e
+            case _:
+                return e
+
+    def shrink_stmt(self, s: stmt) -> stmt:
+        match s:
+            case Expr(Call(Name('print'),[exp])):
+                return Expr(Call(Name('print'), [self.shrink_exp(exp)]))
+            case Expr(exp):
+                return Expr(self.shrink_exp(exp))
+            case Assign([Name(id)], exp):
+                return Assign([Name(id)], self.shrink_exp(exp))
+            case If(exp, body, orelse):
+                return If(self.shrink_exp(exp), [self.shrink_stmt(s) for s in body], [self.shrink_stmt(s) for s in orelse])
+            case _:
+                raise Exception('error in shrink_stmt, unexpected ' + repr(s))
+
+    def shrink(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                stmts = []
+                for stmt in body:
+                    s = self.shrink_stmt(stmt)
+                    stmts.append(s)
+                return Module(stmts)
+            case _:
+                raise Exception('error in shrink, unexpected ' + repr(p))
+
+    ############################################################################
     # Remove Complex Operands
     ############################################################################
 
