@@ -134,9 +134,10 @@ class Compiler:
     # Remove Complex Operands
     ############################################################################
 
-    def rco_exp(self, e: expr, need_atomic : bool) -> Tuple[expr, Temporaries]:
+    def rco_exp(self, e: expr, need_atomic: bool) -> Tuple[expr, Temporaries]:
         def new_tmp_id() -> Name:
             return Name(generate_name('tmp'))
+
         match e:
             case Constant(value) as constant:
                 return (constant, [])
@@ -145,51 +146,63 @@ class Compiler:
             case Call(Name('input_int'), []) as call:
                 if need_atomic:
                     new_id = new_tmp_id()
-                    binding = (new_id, call)
-                    return (new_id, [binding])
-                else:
-                    return (call, [])
-            case UnaryOp(USub(), exp):
+                    return (new_id, [(new_id, call)])
+                return (call, [])
+            case UnaryOp(op, exp):
+                (operand, bindings) = self.rco_exp(exp, need_atomic)
+                result = UnaryOp(op, operand)
                 if need_atomic:
                     new_id = new_tmp_id()
-                    (name, bindings) = self.rco_exp(exp, True)
-                    binding = (new_id, UnaryOp(USub(), name))
-                    bindings.append(binding)
+                    bindings = bindings + [(new_id, result)]
                     return (new_id, bindings)
-                else:
-                    (name, bindings) = self.rco_exp(exp, True)
-                    return (UnaryOp(USub(), name), bindings)
-            case BinOp(left, Add() as op, right) | BinOp(left, Sub() as op, right):
+                return (result, bindings)
+            case BinOp(left, op, right):
+                (left_name, left_bindings) = self.rco_exp(left, need_atomic)
+                (right_name, right_bindings) = self.rco_exp(right, need_atomic)
+                result = BinOp(left_name, op, right_name)
                 if need_atomic:
                     new_id = new_tmp_id()
-                    (left_name, left_bindings) = self.rco_exp(left, True)
-                    (right_name, right_bindings) = self.rco_exp(right, True)
-                    bindings = left_bindings + right_bindings
-                    binding = (new_id, BinOp(left_name, op, right_name))
-                    bindings.append(binding)
+                    bindings = left_bindings + right_bindings + [(new_id, result)]
                     return (new_id, bindings)
-                else:
-                    (left_name, left_bindings) = self.rco_exp(left, True)
-                    (right_name, right_bindings) = self.rco_exp(right, True)
-                    bindings = left_bindings + right_bindings
-                    return (BinOp(left_name, op, right_name), bindings)
+                return (result, left_bindings + right_bindings)
+            case Compare(left, ops, comparators):
+                (left_name, left_bindings) = self.rco_exp(left, need_atomic)
+                reduced = []
+                bindings = left_bindings
+                for comparator in comparators:
+                    (comp_name, comp_bindings) = self.rco_exp(comparator, need_atomic)
+                    reduced.append(comp_name)
+                    bindings.extend(comp_bindings)
+                result = Compare(left_name, ops, reduced)
+                if need_atomic:
+                    new_id = new_tmp_id()
+                    return (new_id, bindings + [(new_id, result)])
+                return (result, bindings)
+            case IfExp(test, body, orelse):
+                (test_name, test_bindings) = self.rco_exp(test, False)
+                (body_name, body_bindings) = self.rco_exp(body, False)
+                (orelse_name, orelse_bindings) = self.rco_exp(orelse, False)
+                result = IfExp(test_name, body_name, orelse_name)
+                if need_atomic:
+                    new_id = new_tmp_id()
+                    bindings = test_bindings + body_bindings + orelse_bindings + [(new_id, result)]
+                    return (new_id, bindings)
+                return (result, test_bindings + body_bindings + orelse_bindings)
             case _:
                 raise Exception('error in rco_exp, unexpected ' + repr(e))
-
 
     def rco_stmt(self, s: stmt) -> List[stmt]:
         def resolve_temporaries(temporaries) -> List[stmt]:
             stmts = []
             for (name, expr) in temporaries:
-                stmt = Assign([name], expr)
-                stmts.append(stmt)
+                stmts.append(Assign([name], expr))
             return stmts
+
         match s:
             case Expr(Call(Name('print'), [exp])):
                 (expr, temporaries) = self.rco_exp(exp, True)
                 stmts = resolve_temporaries(temporaries)
-                call = Expr(Call(Name('print'), [expr]))
-                stmts.append(call)
+                stmts.append(Expr(Call(Name('print'), [expr])))
                 return stmts
             case Expr(exp):
                 (expr, temporaries) = self.rco_exp(exp, False)
@@ -197,10 +210,20 @@ class Compiler:
                 stmts.append(Expr(expr))
                 return stmts
             case Assign([Name(id)], exp):
-                (expr, temporaries) = self.rco_exp(exp, True)
+                (expr, temporaries) = self.rco_exp(exp, False)
                 stmts = resolve_temporaries(temporaries)
-                assign = Assign([Name(id)], expr)
-                stmts.append(assign)
+                stmts.append(Assign([Name(id)], expr))
+                return stmts
+            case If(test, body, orelse):
+                (test_expr, test_bindings) = self.rco_exp(test, False)
+                body_stmts = []
+                for stmt in body:
+                    body_stmts.extend(self.rco_stmt(stmt))
+                orelse_stmts = []
+                for stmt in orelse:
+                    orelse_stmts.extend(self.rco_stmt(stmt))
+                stmts = resolve_temporaries(test_bindings)
+                stmts.append(If(test_expr, body_stmts, orelse_stmts))
                 return stmts
             case _:
                 raise Exception('error in rco_stmt, unexpected ' + repr(s))
