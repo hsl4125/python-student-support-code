@@ -365,6 +365,10 @@ class Compiler:
     # (But there is no type for atoms, so the type of e is given as expr.)
     def select_arg(self, e: expr) -> arg:
         match e:
+            case Constant(True):
+                return Immediate(1)
+            case Constant(False):
+                return Immediate(0)
             case Constant(value):
                 return Immediate(value)
             case Name(id):
@@ -378,15 +382,34 @@ class Compiler:
                 return [Callq('read_int', 0)]
             case Constant(_) | Name(_):
                 return []
-            case UnaryOp(USub(), _):
+            case UnaryOp(USub(), _) | UnaryOp(Not(), _):
                 return []
             case BinOp(_, Add(), _) | BinOp(_, Sub(), _):
+                return []
+            case Compare(_, [_], [_]):
                 return []
             case _:
                 raise Exception('error in select_exp_into, unexpected ' + repr(e))
 
-    def select_assign_into(self, lhs: Name, exp: expr) -> List[instr]:
-        target = self.select_arg(lhs)
+    def select_cc(self, op) -> str:
+        match op:
+            case Eq():
+                return 'e'
+            case NotEq():
+                return 'ne'
+            case Lt():
+                return 'l'
+            case LtE():
+                return 'le'
+            case Gt():
+                return 'g'
+            case GtE():
+                return 'ge'
+            case _:
+                raise Exception('error in select_cc, unexpected ' + repr(op))
+
+    def select_assign_into(self, lhs: Name | Reg, exp: expr) -> List[instr]:
+        target = lhs if isinstance(lhs, Reg) else self.select_arg(lhs)
         match exp:
             case Constant(_) | Name(_):
                 src = self.select_arg(exp)
@@ -394,6 +417,8 @@ class Compiler:
                     return []
                 return [Instr('movq', [src, target])]
             case Call(Name('input_int'), []):
+                if target == Reg('rax'):
+                    return [Callq('read_int', 0)]
                 return [
                     Callq('read_int', 0),
                     Instr('movq', [Reg('rax'), target]),
@@ -405,6 +430,16 @@ class Compiler:
                     instrs.append(Instr('movq', [src, target]))
                 instrs.append(Instr('negq', [target]))
                 return instrs
+            case UnaryOp(Not(), atm):
+                dst = target
+                src = self.select_arg(atm)
+                if src == dst:
+                    return [Instr('xorq', [Immediate(1), dst])]
+                else:
+                    return [
+                        Instr('movq', [src, dst]),
+                        Instr('xorq', [Immediate(1), dst]),
+                    ]
             case BinOp(left, Add(), right):
                 left_arg = self.select_arg(left)
                 right_arg = self.select_arg(right)
@@ -429,10 +464,41 @@ class Compiler:
                     instrs.append(Instr('movq', [left_arg, target]))
                 instrs.append(Instr('subq', [right_arg, target]))
                 return instrs
+            case Compare(left, [op], [right]):
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                cc = self.select_cc(op)
+                return [
+                    Instr('cmpq', [right_arg, left_arg]),
+                    Instr('set' + cc, [ByteReg('al')]),
+                    Instr('movzbq', [ByteReg('al'), target]),
+                ]
             case _:
                 raise Exception(
                     'error in select_assign_into, unexpected ' + repr(exp)
                 )
+
+    def select_tail(self, t: stmt) -> List[instr]:
+        match t:
+            case Return(value):
+                return self.select_assign_into(Reg('rax'), value) + [
+                    Jump('conclusion')
+                ]
+            case Goto(label):
+                return [Jump(label)]
+            case If(Compare(left, [op], [right]), [Goto(thn)], [Goto(els)]):
+                cc = self.select_cc(op)
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                return (
+                    [
+                        Instr('cmpq', [right_arg, left_arg]),
+                        JumpIf(cc, thn),
+                        Jump(els),
+                    ]
+                )
+            case _:
+                raise Exception('error in select_tail, unexpected ' + repr(t))
 
     def select_stmt(self, s: stmt) -> List[instr]:
         match s:
@@ -451,6 +517,17 @@ class Compiler:
 
     def select_instructions(self, p: Module) -> X86Program:
         match p:
+            case CProgram(blocks):
+                x86_blocks = {}
+                for label, block in blocks.items():
+                    if not block:
+                        raise ValueError(f'empty CIf block {label}')
+                    instructions = []
+                    for stmt in block[:-1]:
+                        instructions.extend(self.select_stmt(stmt))
+                    instructions.extend(self.select_tail(block[-1]))
+                    x86_blocks[label] = instructions
+                return X86Program(x86_blocks)
             case Module(body):
                 Instrs = []
                 for stmt in body:
