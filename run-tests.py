@@ -6,7 +6,9 @@ sys.path.append('../python-student-support-code/interp_x86')
 
 import compiler
 import interp_Lif
+import interp_Cif
 import type_check_Lif
+import type_check_Cif
 from utils import run_tests, run_one_test, enable_tracing
 from interp_x86.eval_x86 import interp_x86
 
@@ -15,19 +17,23 @@ enable_tracing()
 compiler = compiler.Compiler()
 
 type_check_Lif = type_check_Lif.TypeCheckLif().type_check
+type_check_Cif = type_check_Cif.TypeCheckCif().type_check
 
 typecheck_dict = {
     'source': type_check_Lif,
     'partial_eval': type_check_Lif,
     'shrink': type_check_Lif,
     'remove_complex_operands': type_check_Lif,
+    'explicate_control': type_check_Cif,
 }
 
 interpLif = interp_Lif.InterpLif().interp
+interpCif = interp_Cif.InterpCif().interp
 interp_dict = {
     'partial_eval': interpLif,
     'shrink': interpLif,
     'remove_complex_operands': interpLif,
+    'explicate_control': interpCif,
     'select_instructions': interp_x86,
     'assign_homes': interp_x86,
     'patch_instructions': interp_x86,
@@ -39,8 +45,8 @@ if True:
               interp_dict)
 else:
     run_one_test(os.getcwd() + '/tests/var/zero.py',
-                 'var',
+                 'if',
                  compiler,
-                 'var',
+                 'if',
                  typecheck_dict,
                  interp_dict)

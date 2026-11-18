@@ -690,7 +690,7 @@ class Uninitialized(expr):
 @dataclass
 class CProgram:
     __match_args__ = ("body",)
-    body: list[stmt]
+    body: dict[str, list[stmt]]
 
     def __str__(self):
         result = []

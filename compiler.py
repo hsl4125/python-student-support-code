@@ -241,6 +241,123 @@ class Compiler:
                 raise Exception('error in remove_complex_operands, unexpected ' + repr(p))
 
     ############################################################################
+    # Explicate Control
+    ############################################################################
+
+    @staticmethod
+    def create_block(
+        stmts: list[stmt], basic_block: dict[str, list[stmt]]
+    ) -> list[stmt]:
+        match stmts:
+            case [Goto(l)]:
+                return stmts
+            case _:
+                label = label_name(generate_name('block'))
+                basic_block[label] = stmts
+                return [Goto(label)]
+
+    def explicate_effect(
+        self, e: expr, cont: list[stmt], basic_blocks: dict[str, list[stmt]]
+    ) -> list[stmt]:
+        match e:
+            case Constant(_) | Name(_):
+                return cont
+            case Call(Name('input_int'), []) as call:
+                return [Expr(call)] + cont
+            case IfExp(test, body, orelse):
+                thn = self.explicate_effect(body, cont, basic_blocks)
+                els = self.explicate_effect(orelse, cont, basic_blocks)
+                return self.explicate_pred(test, thn, els, basic_blocks)
+            case UnaryOp(_, operand):
+                return self.explicate_effect(operand, cont, basic_blocks)
+            case BinOp(left, _, right):
+                cont = self.explicate_effect(right, cont, basic_blocks)
+                return self.explicate_effect(left, cont, basic_blocks)
+            case Compare(left, [_], [right]):
+                cont = self.explicate_effect(right, cont, basic_blocks)
+                return self.explicate_effect(left, cont, basic_blocks)
+            case _:
+                raise Exception('error in explicate_effect, unexpected ' + repr(e))
+
+    def explicate_assign(
+        self,
+        rhs: expr,
+        lhs: Name,
+        cont: list[stmt],
+        basic_blocks: dict[str, list[stmt]],
+    ) -> list[stmt]:
+        match rhs:
+            case IfExp(test, body, orelse):
+                thn = self.explicate_assign(body, lhs, cont, basic_blocks)
+                els = self.explicate_assign(orelse, lhs, cont, basic_blocks)
+                return self.explicate_pred(test, thn, els, basic_blocks)
+            case _:
+                return [Assign([lhs], rhs)] + cont
+
+    def explicate_pred(
+        self,
+        cnd: expr,
+        thn: list[stmt],
+        els: list[stmt],
+        basic_blocks: dict[str, list[stmt]],
+    ) -> list[stmt]:
+        match cnd:
+            case Compare(left, [op], [right]) as comparison:
+                return [If(comparison,
+                           self.create_block(thn, basic_blocks),
+                           self.create_block(els, basic_blocks))]
+            case Constant(True):
+                return thn
+            case Constant(False):
+                return els
+            case UnaryOp(Not(), operand):
+                return self.explicate_pred(operand, els, thn, basic_blocks)
+            case IfExp(test, body, orelse):
+                thn_code = self.explicate_pred(body, thn, els, basic_blocks)
+                els_code = self.explicate_pred(orelse, thn, els, basic_blocks)
+                return self.explicate_pred(test, thn_code, els_code, basic_blocks)
+            case Name(_):
+                comparison = Compare(cnd, [Eq()], [Constant(True)])
+                return [If(comparison,
+                           self.create_block(thn, basic_blocks),
+                           self.create_block(els, basic_blocks))]
+            case _:
+                raise Exception('error in explicate_pred, unexpected ' + repr(cnd))
+
+    def explicate_stmt(
+        self, s: stmt, cont: list[stmt], basic_blocks: dict[str, list[stmt]]
+    ) -> list[stmt]:
+        match s:
+            case Expr(Call(Name('print'), [arg])):
+                return [Expr(Call(Name('print'), [arg]))] + cont
+            case Assign([lhs], rhs):
+                return self.explicate_assign(rhs, lhs, cont, basic_blocks)
+            case Expr(value):
+                return self.explicate_effect(value, cont, basic_blocks)
+            case If(test, body, orelse):
+                thn = cont
+                for s in reversed(body):
+                    thn = self.explicate_stmt(s, thn, basic_blocks)
+                els = cont
+                for s in reversed(orelse):
+                    els = self.explicate_stmt(s, els, basic_blocks)
+                return self.explicate_pred(test, thn, els, basic_blocks)
+            case _:
+                raise Exception('error in explicate_stmt, unexpected ' + repr(s))
+
+    def explicate_control(self, p: Module) -> CProgram:
+        match p:
+            case Module(body):
+                new_body = [Return(Constant(0))]
+                basic_blocks = {}
+                for s in reversed(body):
+                    new_body = self.explicate_stmt(s, new_body, basic_blocks)
+                basic_blocks[label_name('start')] = new_body
+                return CProgram(basic_blocks)
+            case _:
+                raise Exception('error in explicate_control, unexpected ' + repr(p))
+
+    ############################################################################
     # Select Instructions
     ############################################################################
 
