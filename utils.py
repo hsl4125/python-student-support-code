@@ -1211,7 +1211,7 @@ def compile_and_test(compiler, compiler_name,
 
 
     passname = 'partial_eval'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.partial_eval(program)
         trace(program)
@@ -1224,7 +1224,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'shrink'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.shrink(program)
         trace(program)
@@ -1237,7 +1237,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'uniquify'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.uniquify(program)
         trace(program)
@@ -1249,7 +1249,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'reveal_functions'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.reveal_functions(program)
         trace(program)
@@ -1261,7 +1261,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'resolve'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.resolve(program)
         trace(program)
@@ -1274,7 +1274,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'check_bounds'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.check_bounds(program)
         trace(program)
@@ -1287,7 +1287,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'erase_types'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.erase_types(program)
         trace(program)
@@ -1300,7 +1300,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'cast_insert'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.cast_insert(program)
         trace(program)
@@ -1312,7 +1312,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'lower_casts'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.lower_casts(program)
         trace(program)
@@ -1324,7 +1324,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'differentiate_proxies'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.differentiate_proxies(program)
         trace(program)
@@ -1336,7 +1336,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'reveal_casts'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.reveal_casts(program)
         trace(program)
@@ -1348,7 +1348,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'convert_assignments'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.convert_assignments(program)
         trace(program)
@@ -1360,7 +1360,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'convert_to_closures'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.convert_to_closures(program)
         trace(program)
@@ -1372,7 +1372,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'limit_functions'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.limit_functions(program)
         trace(program)
@@ -1386,7 +1386,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'expose_allocation'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.expose_allocation(program)
         trace(program)
@@ -1400,7 +1400,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'remove_complex_operands'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.remove_complex_operands(program)
         trace(program)
@@ -1415,7 +1415,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'explicate_control'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.explicate_control(program)
         trace(program)
@@ -1432,7 +1432,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'select_instructions'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.select_instructions(program)
         trace(program)
@@ -1442,7 +1442,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'assign_homes'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.assign_homes(program)
         trace(program)
@@ -1452,7 +1452,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'patch_instructions'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.patch_instructions(program)
         trace(program)
@@ -1462,7 +1462,7 @@ def compile_and_test(compiler, compiler_name,
                       compiler_name)
 
     passname = 'prelude_and_conclusion'
-    if hasattr(compiler, passname):
+    if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
         program = compiler.prelude_and_conclusion(program)
         trace(program)
@@ -1502,6 +1502,8 @@ def compile_and_test(compiler, compiler_name,
         else:
             print('compiler ' + compiler_name + ', executable failed' \
                   + ' on test ' + os.path.basename(program_root))
+    if total_passes > 0 and successful_passes == total_passes:
+        successful_test = 1
     return (successful_passes, total_passes, successful_test)
 
 
