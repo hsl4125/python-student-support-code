@@ -372,23 +372,33 @@ class Compiler:
             case _:
                 raise Exception('error in select_arg, unexpected ' + repr(e))
 
-    def select_exp(self, e: expr, target: arg | None) -> List[instr]:
+    def select_exp_into(self, e: expr) -> List[instr]:
         match e:
+            case Call(Name('input_int'), []):
+                return [Callq('read_int', 0)]
             case Constant(_) | Name(_):
-                if target is None:
-                    return []
-                src = self.select_arg(e)
+                return []
+            case UnaryOp(USub(), _):
+                return []
+            case BinOp(_, Add(), _) | BinOp(_, Sub(), _):
+                return []
+            case _:
+                raise Exception('error in select_exp_into, unexpected ' + repr(e))
+
+    def select_assign_into(self, lhs: Name, exp: expr) -> List[instr]:
+        target = self.select_arg(lhs)
+        match exp:
+            case Constant(_) | Name(_):
+                src = self.select_arg(exp)
                 if src == target:
                     return []
                 return [Instr('movq', [src, target])]
             case Call(Name('input_int'), []):
-                instrs = [Callq('read_int', 0)]
-                if target is not None:
-                    instrs.append(Instr('movq', [Reg('rax'), target]))
-                return instrs
+                return [
+                    Callq('read_int', 0),
+                    Instr('movq', [Reg('rax'), target]),
+                ]
             case UnaryOp(USub(), atm):
-                if target is None:
-                    return []
                 src = self.select_arg(atm)
                 instrs = []
                 if src != target:
@@ -396,8 +406,6 @@ class Compiler:
                 instrs.append(Instr('negq', [target]))
                 return instrs
             case BinOp(left, Add(), right):
-                if target is None:
-                    return []
                 left_arg = self.select_arg(left)
                 right_arg = self.select_arg(right)
                 if target == left_arg or target == right_arg:
@@ -408,8 +416,6 @@ class Compiler:
                     Instr('addq', [right_arg, target]),
                 ]
             case BinOp(left, Sub(), right):
-                if target is None:
-                    return []
                 left_arg = self.select_arg(left)
                 right_arg = self.select_arg(right)
                 if target == right_arg and target != left_arg:
@@ -424,22 +430,22 @@ class Compiler:
                 instrs.append(Instr('subq', [right_arg, target]))
                 return instrs
             case _:
-                raise Exception('error in select_exp, unexpected ' + repr(e))
+                raise Exception(
+                    'error in select_assign_into, unexpected ' + repr(exp)
+                )
 
     def select_stmt(self, s: stmt) -> List[instr]:
-        Instrs = []
         match s:
             case Expr(Call(Name('print'), [exp])):
                 src = self.select_arg(exp)
-                mov = Instr('movq', [src, Reg('rdi')])
-                call = Callq('print_int', 1)
-                Instrs.append(mov)
-                Instrs.append(call)
-                return Instrs
+                return [
+                    Instr('movq', [src, Reg('rdi')]),
+                    Callq('print_int', 1),
+                ]
             case Expr(exp):
-                return self.select_exp(exp, None)
-            case Assign([Name(id)], exp):
-                return self.select_exp(exp, Variable(id))
+                return self.select_exp_into(exp)
+            case Assign([lhs], exp):
+                return self.select_assign_into(lhs, exp)
             case _:
                 raise Exception('error in select_stmt, unexpected ' + repr(s))
 
