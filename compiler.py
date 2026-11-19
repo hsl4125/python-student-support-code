@@ -547,7 +547,7 @@ class Compiler:
             for i in reversed(instrs[-2:]):
                 if isinstance(i, Jump) or isinstance(i, JumpIf):
                     b = blocks.get(i.label, None)
-                    if b == None:
+                    if b == None and i.label != 'conclusion':
                         raise Exception('error in build_control_flow_graph blocks is not exist: ' + i.label)
                     jump_blocks.append(i.label)
             return jump_blocks
@@ -633,8 +633,9 @@ class Compiler:
     # R(K): read instruction I(k)
     # W(K): write instruction I(k)
     #
-    # Initialize each block's live-before set to empty, then repeatedly scan
-    # every block backwards using the previous iteration's block-entry sets.
+    # Build the CFG and topologically sort its transpose so successor blocks
+    # are analyzed before their predecessors. LIf CFGs are acyclic, so each
+    # block can be analyzed once in this reverse topological order.
     # A Jump takes its target block's live-before set; a JumpIf unions that
     # set with the live set of the following instruction. After each scan,
     # save the first instruction's live-before set for that block. Stop when
@@ -642,54 +643,52 @@ class Compiler:
     # are returned. The absent "conclusion" block has no live locations.
     #
     # Pseudocode:
-    #   live_before_block = {label: ∅}
-    #   target_before(L) = live_before_block[L], or ∅ for the absent conclusion
-    #   repeat:
-    #       next_live_before_block = {}
-    #       for each block B:
-    #           live = ∅
-    #           for each instruction i in reverse(B):
-    #               if i is Jump(L):        live_after[i] = target_before(L)
-    #               elif i is JumpIf(_, L): live_after[i] = live ∪ target_before(L)
-    #               else:                   live_after[i] = live
-    #               live = (live_after[i] − W(i)) ∪ R(i)
-    #           next_live_before_block[B] = live
-    #       stop if next_live_before_block == live_before_block
-    #       live_before_block = next_live_before_block
+    #   cfg = build_control_flow_graph(blocks)
+    #   order = topological_sort(transpose(cfg))
+    #   live_before_block = {label: ∅ for label in cfg}
+    #   for each block B in order:
+    #       live = ∅
+    #       for each instruction i in reverse(B):
+    #           if i is Jump(L):        live_after[i] = live_before_block[L]
+    #           elif i is JumpIf(_, L): live_after[i] = live ∪ live_before_block[L]
+    #           else:                   live_after[i] = live
+    #           live = (live_after[i] − W(i)) ∪ R(i)
+    #       live_before_block[B] = live
     def uncover_live(self, s: dict[str, list[instr]]) -> dict[instr, set[location]]:
         if not isinstance(s, dict):
             raise TypeError('uncover_live expects a dictionary of basic blocks')
 
         blocks = s
-        live_before_block = {label: set() for label in blocks}
         for label, instructions in blocks.items():
             if not instructions:
                 raise ValueError(f'empty basic block: {label}')
 
-        def target_live_before(label: str) -> set[location]:
-            if label in live_before_block:
-                return live_before_block[label]
-            if label == 'conclusion':
-                return set()
-            raise ValueError(f'jump target does not exist: {label}')
+        cfg = self.build_control_flow_graph(blocks)
+        order = topological_sort(transpose(cfg))
+        if len(order) != len(cfg.vertices()):
+            raise ValueError('liveness analysis requires an acyclic control-flow graph')
 
-        while True:
-            next_live_before_block = {}
-            live_after = {}
-            for label, instructions in blocks.items():
-                after_i = set()
-                for i in reversed(instructions):
-                    if isinstance(i, Jump):
-                        after_i = target_live_before(i.label)
-                    elif isinstance(i, JumpIf):
-                        after_i = after_i | target_live_before(i.label)
-                    live_after[i] = after_i
-                    after_i = after_i.difference(self.W(i)) | self.R(i)
-                next_live_before_block[label] = after_i
+        live_before_block = {label: set() for label in cfg.vertices()}
+        live_after = {}
+        for label in order:
+            if label not in blocks:
+                continue
 
-            if next_live_before_block == live_before_block:
-                return live_after
-            live_before_block = next_live_before_block
+            after_i = set()
+            for i in reversed(blocks[label]):
+                if isinstance(i, Jump):
+                    if not cfg.has_edge(label, i.label):
+                        raise ValueError(f'{i.label} is not a successor of block {label}')
+                    after_i = live_before_block[i.label]
+                elif isinstance(i, JumpIf):
+                    if not cfg.has_edge(label, i.label):
+                        raise ValueError(f'{i.label} is not a successor of block {label}')
+                    after_i = after_i | live_before_block[i.label]
+                live_after[i] = after_i
+                after_i = after_i.difference(self.W(i)) | self.R(i)
+            live_before_block[label] = after_i
+
+        return live_after
 
     def all_home_vars(self, s: List[instr]) -> List[Variable]:
         home_vars = []
