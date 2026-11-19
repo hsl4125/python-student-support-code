@@ -581,9 +581,11 @@ class Compiler:
 
     def R(self, i: instr) -> set[location]:
         match i:
+            case Instr('cmpq', [src, dst]):
+                return self.operand_locations(src) | self.operand_locations(dst)
             case Instr(iname, [src, dst]) if iname in ['addq', 'subq']:
                 return self.operand_locations(src) | self.operand_locations(dst)
-            case Instr('movq', [src, dst]):
+            case Instr(iname, [src, dst]) if iname in ['movq', 'movzbq']:
                 return self.operand_locations(src) | self.address_base_locations(dst)
             case Instr('negq', [dst]):
                 return self.operand_locations(dst)
@@ -595,7 +597,7 @@ class Compiler:
                 passed = [Reg('rdi'), Reg('rsi'), Reg('rdx'), Reg('rcx'), Reg('r8'), Reg('r9')]
                 return set(passed[:n])
             case Instr('retq', []):
-                return {Reg('rsp')}
+                return {Reg('rax'), Reg('rsp')}
             case _:
                 return set()
 
@@ -604,6 +606,10 @@ class Compiler:
             case Instr(iname, [_, dst]) if iname in ['addq', 'subq']:
                 return self.written_locations(dst)
             case Instr('movq', [_, dst]):
+                return self.written_locations(dst)
+            case Instr('movzbq', [_, dst]):
+                return self.written_locations(dst)
+            case Instr(iname, [dst]) if iname.startswith('set'):
                 return self.written_locations(dst)
             case Instr('negq', [dst]):
                 return self.written_locations(dst)
@@ -620,24 +626,70 @@ class Compiler:
                 return set()
 
     # Liveness Analysis
+    #
     # Lafter(k) = Lbefore(k + 1)
-    # Lafter(n) = ∅  (last instruction)
+    # Lafter(last) = ∅ for a terminal block with no successors.
     # Lbefore(k) = (Lafter(k) − W(k)) ∪ R(k)
     # R(K): read instruction I(k)
     # W(K): write instruction I(k)
-    def uncover_live(self, s: List[instr]) -> dict[instr, set[location]]:
-        live_after = {}
-        if not s:
-            return live_after
-        after_i = set()
-        before_i = set()
+    #
+    # Initialize each block's live-before set to empty, then repeatedly scan
+    # every block backwards using the previous iteration's block-entry sets.
+    # A Jump takes its target block's live-before set; a JumpIf unions that
+    # set with the live set of the following instruction. After each scan,
+    # save the first instruction's live-before set for that block. Stop when
+    # no block-entry set changes; the final per-instruction live-after sets
+    # are returned. The absent "conclusion" block has no live locations.
+    #
+    # Pseudocode:
+    #   live_before_block = {label: ∅}
+    #   target_before(L) = live_before_block[L], or ∅ for the absent conclusion
+    #   repeat:
+    #       next_live_before_block = {}
+    #       for each block B:
+    #           live = ∅
+    #           for each instruction i in reverse(B):
+    #               if i is Jump(L):        live_after[i] = target_before(L)
+    #               elif i is JumpIf(_, L): live_after[i] = live ∪ target_before(L)
+    #               else:                   live_after[i] = live
+    #               live = (live_after[i] − W(i)) ∪ R(i)
+    #           next_live_before_block[B] = live
+    #       stop if next_live_before_block == live_before_block
+    #       live_before_block = next_live_before_block
+    def uncover_live(self, s: dict[str, list[instr]]) -> dict[instr, set[location]]:
+        if not isinstance(s, dict):
+            raise TypeError('uncover_live expects a dictionary of basic blocks')
 
-        for i in reversed(s):
-            before_i = after_i.difference(self.W(i)) | self.R(i)
-            live_after[i] = after_i
-            after_i = before_i
-        
-        return live_after
+        blocks = s
+        live_before_block = {label: set() for label in blocks}
+        for label, instructions in blocks.items():
+            if not instructions:
+                raise ValueError(f'empty basic block: {label}')
+
+        def target_live_before(label: str) -> set[location]:
+            if label in live_before_block:
+                return live_before_block[label]
+            if label == 'conclusion':
+                return set()
+            raise ValueError(f'jump target does not exist: {label}')
+
+        while True:
+            next_live_before_block = {}
+            live_after = {}
+            for label, instructions in blocks.items():
+                after_i = set()
+                for i in reversed(instructions):
+                    if isinstance(i, Jump):
+                        after_i = target_live_before(i.label)
+                    elif isinstance(i, JumpIf):
+                        after_i = after_i | target_live_before(i.label)
+                    live_after[i] = after_i
+                    after_i = after_i.difference(self.W(i)) | self.R(i)
+                next_live_before_block[label] = after_i
+
+            if next_live_before_block == live_before_block:
+                return live_after
+            live_before_block = next_live_before_block
 
     def all_home_vars(self, s: List[instr]) -> List[Variable]:
         home_vars = []
@@ -646,12 +698,6 @@ class Compiler:
             match i:
                 case Instr(_, args):
                     operands = args
-                #case IndirectCallq(func, _):
-                #    operands = (func,)
-                #case IndirectJump(target):
-                #    operands = (target,)
-                #case TailJump(func, _):
-                #    operands = (func,)
                 case _:
                     operands = ()
             for operand in operands:
@@ -851,7 +897,7 @@ class Compiler:
 
                 instructions = body['main']
                 homes = self.all_home_vars(instructions)
-                live_after = self.uncover_live(instructions)
+                live_after = self.uncover_live(body)
 
                 interference = self.build_interference(
                     homes, live_after)
