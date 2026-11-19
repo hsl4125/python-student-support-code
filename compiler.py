@@ -583,7 +583,7 @@ class Compiler:
         match i:
             case Instr('cmpq', [src, dst]):
                 return self.operand_locations(src) | self.operand_locations(dst)
-            case Instr(iname, [src, dst]) if iname in ['addq', 'subq']:
+            case Instr(iname, [src, dst]) if iname in ['addq', 'subq', 'xorq']:
                 return self.operand_locations(src) | self.operand_locations(dst)
             case Instr(iname, [src, dst]) if iname in ['movq', 'movzbq']:
                 return self.operand_locations(src) | self.address_base_locations(dst)
@@ -603,7 +603,7 @@ class Compiler:
 
     def W(self, i: instr) -> set[location]:
         match i:
-            case Instr(iname, [_, dst]) if iname in ['addq', 'subq']:
+            case Instr(iname, [_, dst]) if iname in ['addq', 'subq', 'xorq']:
                 return self.written_locations(dst)
             case Instr('movq', [_, dst]):
                 return self.written_locations(dst)
@@ -654,11 +654,10 @@ class Compiler:
     #           else:                   live_after[i] = live
     #           live = (live_after[i] − W(i)) ∪ R(i)
     #       live_before_block[B] = live
-    def uncover_live(self, s: dict[str, list[instr]]) -> dict[instr, set[location]]:
-        if not isinstance(s, dict):
+    def uncover_live(self, blocks: dict[str, list[instr]]) -> dict[instr, set[location]]:
+        if not isinstance(blocks, dict):
             raise TypeError('uncover_live expects a dictionary of basic blocks')
 
-        blocks = s
         for label, instructions in blocks.items():
             if not instructions:
                 raise ValueError(f'empty basic block: {label}')
@@ -690,19 +689,20 @@ class Compiler:
 
         return live_after
 
-    def all_home_vars(self, s: List[instr]) -> List[Variable]:
+    def all_home_vars(self, blocks: dict[str, list[instr]]) -> List[Variable]:
         home_vars = []
         seen = set()
-        for i in s:
-            match i:
-                case Instr(_, args):
-                    operands = args
-                case _:
-                    operands = ()
-            for operand in operands:
-                if isinstance(operand, Variable) and operand not in seen:
-                    seen.add(operand)
-                    home_vars.append(operand)
+        for instructions in blocks.values():
+            for i in instructions:
+                match i:
+                    case Instr(_, args):
+                        operands = args
+                    case _:
+                        operands = ()
+                for operand in operands:
+                    if isinstance(operand, Variable) and operand not in seen:
+                        seen.add(operand)
+                        home_vars.append(operand)
         return home_vars
 
     # build_interference
@@ -720,12 +720,8 @@ class Compiler:
     ) -> UndirectedAdjList:
         g = UndirectedAdjList()
 
-        seen = set()
-        for instructions in blocks.values():
-            for vertex in self.all_home_vars(instructions):
-                if vertex not in seen:
-                    seen.add(vertex)
-                    g.add_vertex(vertex)
+        for vertex in self.all_home_vars(blocks):
+            g.add_vertex(vertex)
 
         def add_edge(u, v):
             if not g.has_edge(u, v):
@@ -746,16 +742,18 @@ class Compiler:
                                 add_edge(d, v)
         return g
 
-    def move_related_graph(self, homes: List[Variable], s: List[instr]) -> UndirectedAdjList:
+    def move_related_graph(self, homes: List[Variable],
+                           blocks: dict[str, list[instr]]) -> UndirectedAdjList:
         g = UndirectedAdjList()
         for variable in homes:
             g.add_vertex(variable)
 
-        for instruction in s:
-            match instruction:
-                case Instr('movq', [Variable() as src, Variable() as dst]):
-                    if src != dst and not g.has_edge(src, dst):
-                        g.add_edge(src, dst)
+        for instructions in blocks.values():
+            for instruction in instructions:
+                match instruction:
+                    case Instr('movq', [Variable() as src, Variable() as dst]):
+                        if src != dst and not g.has_edge(src, dst):
+                            g.add_edge(src, dst)
 
         return g
 
@@ -853,6 +851,9 @@ class Compiler:
         register_colors = {}
         for color in range(-5, 11):
             register_colors[color_to_location(color)] = color
+        # select_instructions currently emits only %al (for setcc/movzbq);
+        # add other byte registers here if the pass starts emitting them.
+        register_colors[ByteReg('al')] = register_colors[Reg('rax')]
 
         def precolor_register_neighbors():
             for variable in w:
@@ -893,20 +894,14 @@ class Compiler:
                 homes[variable] = Deref('rbp', home.offset - spill_offset)
         return homes
 
-    # TODO: multi block
     def assign_homes(self, p: X86Program) -> X86Program:
         match p:
             case X86Program(body) if isinstance(body, dict):
-                if set(body) != {'main'}:
-                    raise ValueError(
-                        "assign_homes currently supports only a single 'main' block")
-
-                instructions = body['main']
-                homes = self.all_home_vars(instructions)
+                homes = self.all_home_vars(body)
                 live_after = self.uncover_live(body)
 
                 interference = self.build_interference(body, live_after)
-                move_graph = self.move_related_graph(homes, instructions)
+                move_graph = self.move_related_graph(homes, body)
                 home = self.allocate_registers(interference, move_graph, p)
 
                 def assign_arg(a: arg) -> arg:
@@ -923,24 +918,25 @@ class Compiler:
                         case _:
                             return i
 
-                body['main'] = [assign_instr(i) for i in instructions]
+                for label, block in body.items():
+                    body[label] = [assign_instr(i) for i in block]
 
-                def align16(n):
-                    assert(n % 8 == 0)
-                    if n % 16 == 0:
-                        return n
-                    else:
-                        return n + 8
-
-                # stack_size = align(8S + 8C) - 8C
-                spill_locations = {
-                    location for location in home.values()
+                # rsp must be 16-byte aligned before every call. After pushing
+                # %rbp and keeping c callee-saved registers on the stack,
+                # rsp = rbp - 8c, so stack_size is chosen such that
+                # 8c + stack_size is a multiple of 16.
+                c = len(p.used_callee)
+                spill_offsets = {
+                    -location.offset
+                    for location in home.values()
                     if isinstance(location, Deref)
                     and location.reg == 'rbp'
+                    and location.offset < 0
                 }
-                s = len(spill_locations)
-                c = len(p.used_callee)
-                p.stack_size = align16((s + c) * 8) - (8 * c)
+                frame = max([8 * c] + list(spill_offsets))
+                p.stack_size = align(frame, 16) - 8 * c
+                assert p.stack_size >= 0
+                assert (p.stack_size + 8 * c) % 16 == 0
 
                 return p
             case _:
