@@ -962,6 +962,15 @@ class Compiler:
             case Instr('movq', [Immediate(n), dst]) if not (MIN_INT32 <= n <= MAX_INT32):
                 instrs.append(Instr('movq', [Immediate(n), Reg('rax')]))
                 instrs.append(Instr('movq', [Reg('rax'), dst]))
+            case Instr('cmpq', [src, Immediate() as imm]):
+                instrs.append(Instr('movq', [imm, Reg('rax')]))
+                instrs.append(Instr('cmpq', [src, Reg('rax')]))
+            case Instr('cmpq', [Deref() as src, Deref() as dst]):
+                instrs.append(Instr('movq', [dst, Reg('rax')]))
+                instrs.append(Instr('cmpq', [src, Reg('rax')]))
+            case Instr('movzbq', [src, dst]) if not isinstance(dst, Reg):
+                instrs.append(Instr('movzbq', [src, Reg('rax')]))
+                instrs.append(Instr('movq', [Reg('rax'), dst]))
             case _:
                 instrs.append(i)
         return instrs
