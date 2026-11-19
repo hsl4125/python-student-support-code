@@ -532,6 +532,35 @@ class Compiler:
     # Assign Homes
     ############################################################################
 
+    def build_control_flow_graph(self, blocks: dict[str, list[instr]]) -> DirectedAdjList:
+        cfg = DirectedAdjList()
+        # init vertex
+        for label, block in blocks.items():
+            cfg.add_vertex(label)
+
+        def get_jump_blocks(label: str, instrs: list[instr]) -> list[str]:
+            if not instrs:
+                raise Exception('error in build_control_flow_graph, blocks is empty: ' + label)
+
+            jump_blocks = []
+            # the last two instructions
+            for i in reversed(instrs[-2:]):
+                if isinstance(i, Jump) or isinstance(i, JumpIf):
+                    b = blocks.get(i.label, None)
+                    if b == None:
+                        raise Exception('error in build_control_flow_graph blocks is not exist: ' + i.label)
+                    jump_blocks.append(i.label)
+            return jump_blocks
+
+        for label, block in blocks.items():
+            to_labels = get_jump_blocks(label, block)
+            for b in to_labels:
+                if cfg.has_edge(label, b):
+                    continue
+                cfg.add_edge(label, b)
+
+        return cfg
+
     def operand_locations(self, l: arg) -> set[location]:
         match l:
             case Variable(id): return {l}
