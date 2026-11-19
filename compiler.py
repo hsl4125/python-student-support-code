@@ -1057,6 +1057,7 @@ class Compiler:
             ]
             instrs.extend(Instr('pushq', [reg]) for reg in used_callee)
             instrs.append(Instr('subq', [Immediate(stack_size), Reg('rsp')]))
+            instrs.append(Jump('start'))
             return instrs
 
         def conclusion(stack_size) -> List[instr]:
@@ -1075,7 +1076,6 @@ class Compiler:
                     raise ValueError(
                         "prelude_and_conclusion requires a 'start' block")
                 main_instrs = prelude(p.stack_size)
-                main_instrs.append(Jump('start'))
                 new_body = {'main': main_instrs, 'start': body['start']}
                 body.pop('start')
                 for label, block in body.items():
