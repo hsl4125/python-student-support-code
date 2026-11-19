@@ -1070,14 +1070,18 @@ class Compiler:
             return instrs
 
         match p:
-            case X86Program(body):
-                instrs = body.get('main')
-                if instrs == None:
-                    raise Exception('error in prelude_and_conclusion, main block is empty')
+            case X86Program(body) if isinstance(body, dict):
+                if 'start' not in body:
+                    raise ValueError(
+                        "prelude_and_conclusion requires a 'start' block")
                 main_instrs = prelude(p.stack_size)
-                main_instrs += instrs
-                main_instrs += conclusion(p.stack_size)
-                body['main'] = main_instrs
+                main_instrs.append(Jump('start'))
+                new_body = {'main': main_instrs, 'start': body['start']}
+                body.pop('start')
+                for label, block in body.items():
+                    new_body[label] = block
+                new_body['conclusion'] = conclusion(p.stack_size)
+                p.body = new_body
                 return p
             case _:
                 raise Exception('error in prelude_and_conclusion, unexpected ' + repr(p))
