@@ -45,7 +45,7 @@ if True:
               typecheck_dict,
               interp_dict)
 else:
-    run_one_test(os.getcwd() + '/tests/var/zero.py',
+    run_one_test(os.getcwd() + '/tests/if/stack-spill-minimal.py',
                  'if',
                  compiler,
                  'if',

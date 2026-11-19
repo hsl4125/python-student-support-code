@@ -950,6 +950,26 @@ class Compiler:
                 homes[variable] = Deref('rbp', home.offset - spill_offset)
         return homes
 
+    # %rsp must be 16-byte aligned before every call. The c callee-saved
+    # registers are pushed after %rbp, occupying 8c bytes, and the spill
+    # slots follow below them. The offsets in `homes` already include that
+    # 8c area, so frame is the total number of bytes needed below %rbp;
+    # stack_size is chosen so that 8c + stack_size is a multiple of 16.
+    def compute_stack_size(self, homes: List[arg],
+                           used_callee: List[Reg]) -> int:
+        c = len(used_callee)
+        frame = 8 * c
+        for location in homes:
+            if (isinstance(location, Deref)
+                    and location.reg == 'rbp'
+                    and location.offset < 0):
+                frame = max(frame, -location.offset)
+        stack_size = align(frame, 16) - 8 * c
+        assert stack_size >= 0
+        assert (stack_size + 8 * c) % 16 == 0
+        assert stack_size + 8 * c >= frame
+        return stack_size
+
     def assign_homes(self, p: X86Program) -> X86Program:
         match p:
             case X86Program(body) if isinstance(body, dict):
@@ -977,22 +997,8 @@ class Compiler:
                 for label, block in body.items():
                     body[label] = [assign_instr(i) for i in block]
 
-                # rsp must be 16-byte aligned before every call. After pushing
-                # %rbp and keeping c callee-saved registers on the stack,
-                # rsp = rbp - 8c, so stack_size is chosen such that
-                # 8c + stack_size is a multiple of 16.
-                c = len(p.used_callee)
-                spill_offsets = {
-                    -location.offset
-                    for location in home.values()
-                    if isinstance(location, Deref)
-                    and location.reg == 'rbp'
-                    and location.offset < 0
-                }
-                frame = max([8 * c] + list(spill_offsets))
-                p.stack_size = align(frame, 16) - 8 * c
-                assert p.stack_size >= 0
-                assert (p.stack_size + 8 * c) % 16 == 0
+                p.stack_size = self.compute_stack_size(
+                    list(home.values()), p.used_callee)
 
                 return p
             case _:
