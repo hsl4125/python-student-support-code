@@ -714,12 +714,19 @@ class Compiler:
     #
     # 2. For any other instruction Ik, for every d ∈ W(k) and every v∈ Lafter(k), if v ̸= d, add
     #    the edge (d, v).
-    def build_interference(self, homes: List[Variable], live_after: dict[instr, set[location]]) -> UndirectedAdjList:
+    def build_interference(
+        self,
+        blocks: dict[str, list[instr]],
+        live_after: dict[instr, set[location]],
+    ) -> UndirectedAdjList:
         g = UndirectedAdjList()
 
-        # init vertexs
-        for vertex in homes:
-            g.add_vertex(vertex)
+        seen = set()
+        for instructions in blocks.values():
+            for vertex in self.all_home_vars(instructions):
+                if vertex not in seen:
+                    seen.add(vertex)
+                    g.add_vertex(vertex)
 
         def add_edge(u, v):
             if not g.has_edge(u, v):
@@ -728,7 +735,7 @@ class Compiler:
         for i, lafter in live_after.items():
             w = self.W(i)
             match i:
-                case Instr('movq', [src, _]):
+                case Instr(iname, [src, _]) if iname in ['movq', 'movzbq']:
                     for d in w:
                         for v in lafter:
                             if v not in (src, d):
@@ -899,8 +906,7 @@ class Compiler:
                 homes = self.all_home_vars(instructions)
                 live_after = self.uncover_live(body)
 
-                interference = self.build_interference(
-                    homes, live_after)
+                interference = self.build_interference(body, live_after)
                 move_graph = self.move_related_graph(homes, instructions)
                 home = self.allocate_registers(interference, move_graph, p)
 
