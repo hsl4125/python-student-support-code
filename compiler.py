@@ -43,39 +43,95 @@ class Compiler:
             case _:
                 return BinOp(l, Add(), r)
 
+    def pe_cmp(self, op, l: expr, r: expr) -> expr:
+        match (l, r):
+            case (Constant(a), Constant(b)):
+                match op:
+                    case Eq(): return Constant(a == b)
+                    case NotEq(): return Constant(a != b)
+                    case Lt(): return Constant(a < b)
+                    case LtE(): return Constant(a <= b)
+                    case Gt(): return Constant(a > b)
+                    case GtE(): return Constant(a >= b)
+            case _:
+                pass
+        return Compare(l, [op], [r])
+
     def pe_exp(self, e: expr) -> expr:
         match e:
+            case Constant(_) | Name(_):
+                return e
             case UnaryOp(USub(), exp):
-                return self.pe_neg(self.residual(exp))
-            case BinOp(l, Add(), r):
-                return self.pe_add(self.residual(l), self.residual(r))
-            case BinOp(l, Sub(), r):
-                return self.pe_add(self.residual(l), self.pe_neg(self.residual(r)))
+                return self.pe_neg(self.residual(self.pe_exp(exp)))
+            case UnaryOp(Not(), exp):
+                inner = self.pe_exp(exp)
+                match inner:
+                    case Constant(True): return Constant(False)
+                    case Constant(False): return Constant(True)
+                    case UnaryOp(Not(), operand): return operand
+                    case _: return UnaryOp(Not(), inner)
+            case BinOp(left, Add(), right):
+                return self.pe_add(self.residual(self.pe_exp(left)),
+                                   self.residual(self.pe_exp(right)))
+            case BinOp(left, Sub(), right):
+                return self.pe_add(self.residual(self.pe_exp(left)),
+                                   self.pe_neg(self.residual(self.pe_exp(right))))
+            case Compare(left, [op], [right]):
+                return self.pe_cmp(op, self.pe_exp(left), self.pe_exp(right))
+            case BoolOp(And(), [left, right]):
+                l = self.pe_exp(left)
+                r = self.pe_exp(right)
+                match l:
+                    case Constant(True): return r
+                    case Constant(False): return Constant(False)
+                    case _: return BoolOp(And(), [l, r])
+            case BoolOp(Or(), [left, right]):
+                l = self.pe_exp(left)
+                r = self.pe_exp(right)
+                match l:
+                    case Constant(True): return Constant(True)
+                    case Constant(False): return r
+                    case _: return BoolOp(Or(), [l, r])
+            case IfExp(test, body, orelse):
+                t = self.pe_exp(test)
+                b = self.pe_exp(body)
+                o = self.pe_exp(orelse)
+                match t:
+                    case Constant(True): return b
+                    case Constant(False): return o
+                    case _: return IfExp(t, b, o)
             case _:
-                #raise Exception('error in pe_exp, unexpected ' + repr(e))
                 return e
 
-    def pe_stmt(self, s: stmt) -> stmt:
+    def pe_stmts(self, stmts: List[stmt]) -> List[stmt]:
+        result = []
+        for s in stmts:
+            result.extend(self.pe_stmt(s))
+        return result
+
+    def pe_stmt(self, s: stmt) -> List[stmt]:
         match s:
             case Expr(Call(Name('print'), [exp])):
-                e = self.pe_exp(exp)
-                return Expr(Call(Name('print'), [e]))
+                return [Expr(Call(Name('print'), [self.pe_exp(exp)]))]
             case Expr(exp):
-                return Expr(self.pe_exp(exp))
+                return [Expr(self.pe_exp(exp))]
             case Assign([Name(id)], exp):
-                e = self.pe_exp(exp)
-                return Assign([Name(id)], e)
+                return [Assign([Name(id)], self.pe_exp(exp))]
+            case If(test, body, orelse):
+                t = self.pe_exp(test)
+                b = self.pe_stmts(body)
+                o = self.pe_stmts(orelse)
+                match t:
+                    case Constant(True): return b
+                    case Constant(False): return o
+                    case _: return [If(t, b, o)]
             case _:
-                #raise Exception('error in pe_stmt, unexpected ' + repr(s))
-                return s
+                return [s]
 
     def partial_eval(self, p: Module) -> Module:
         match p:
             case Module(body):
-                stmts = []
-                for stmt in body:
-                    stmts.append(self.pe_stmt(stmt))
-                return Module(stmts)
+                return Module(self.pe_stmts(body))
             case _:
                 raise Exception('error in partial_eval, unexpected ' + repr(p))
 
