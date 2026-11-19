@@ -512,7 +512,7 @@ class Compiler:
             case _:
                 raise Exception('error in select_stmt, unexpected ' + repr(s))
 
-    def select_instructions(self, p: Module) -> X86Program:
+    def select_instructions(self, p: CProgram) -> X86Program:
         match p:
             case CProgram(blocks):
                 x86_blocks = {}
@@ -525,12 +525,6 @@ class Compiler:
                     instructions.extend(self.select_tail(block[-1]))
                     x86_blocks[label] = instructions
                 return X86Program(x86_blocks)
-            case Module(body):
-                Instrs = []
-                for stmt in body:
-                    s = self.select_stmt(stmt)
-                    Instrs += s
-                return X86Program({'main' : Instrs})
             case _:
                 raise Exception('error in select_instructions, unexpected ' + repr(p))
 
