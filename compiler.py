@@ -1,5 +1,6 @@
 import ast
 from ast import *
+import typing
 from utils import *
 from x86_ast import *
 import os
@@ -8,6 +9,38 @@ from graph import *
 
 Binding = Tuple[Name, expr]
 Temporaries = List[Binding]
+
+
+@dataclass
+class Promise:
+    fun: typing.Callable[[], list[stmt]]
+    cache: typing.Optional[list[stmt]] = None
+    def force(self) -> list[stmt]:
+        if self.cache is None:
+            self.cache = self.fun()
+        return self.cache
+
+
+# A "promise" is either an already-computed list of statements or a delayed
+# computation (Promise) that produces one when forced.
+Code = typing.Union[list[stmt], Promise]
+
+
+def force(promise: Code) -> list[stmt]:
+    return promise.force() if isinstance(promise, Promise) else promise
+
+
+def create_block(promise: Code, basic_blocks: dict[str, list[stmt]]) -> Promise:
+    def delay() -> list[stmt]:
+        stmts = force(promise)
+        match stmts:
+            case [Goto(l)]:
+                return stmts
+            case _:
+                label = label_name(generate_name('block'))
+                basic_blocks[label] = stmts
+                return [Goto(label)]
+    return Promise(delay)
 
 
 class Compiler:
@@ -266,7 +299,7 @@ class Compiler:
                 return stmts
             case _:
                 raise Exception('error in rco_stmt, unexpected ' + repr(s))
-        
+
     def remove_complex_operands(self, p: Module) -> Module:
         match p:
             case Module(body):
@@ -281,35 +314,29 @@ class Compiler:
     ############################################################################
     # Explicate Control
     ############################################################################
-
-    @staticmethod
-    def create_block(
-        stmts: list[stmt], basic_block: dict[str, list[stmt]]
-    ) -> list[stmt]:
-        match stmts:
-            case [Goto(l)]:
-                return stmts
-            case _:
-                label = label_name(generate_name('block'))
-                basic_block[label] = stmts
-                return [Goto(label)]
+    
+    def explicate_stmts(
+        self, stmts: list[stmt], cont: Code, basic_blocks: dict[str, list[stmt]]
+    ) -> Code:
+        for s in reversed(stmts):
+            cont = self.explicate_stmt(s, cont, basic_blocks)
+        return cont
 
     def explicate_effect(
-        self, e: expr, cont: list[stmt], basic_blocks: dict[str, list[stmt]]
-    ) -> list[stmt]:
+        self, e: expr, cont: Code, basic_blocks: dict[str, list[stmt]]
+    ) -> Code:
         match e:
             case Constant(_) | Name(_):
                 return cont
             case Call(Name('input_int'), []) as call:
-                return [Expr(call)] + cont
+                return [Expr(call)] + force(cont)
             case Begin(stmts, result):
                 cont = self.explicate_effect(result, cont, basic_blocks)
-                for stmt in reversed(stmts):
-                    cont = self.explicate_stmt(stmt, cont, basic_blocks)
-                return cont
+                return self.explicate_stmts(stmts, cont, basic_blocks)
             case IfExp(test, body, orelse):
-                thn = self.explicate_effect(body, cont, basic_blocks)
-                els = self.explicate_effect(orelse, cont, basic_blocks)
+                cont_block = create_block(cont, basic_blocks)
+                thn = Promise(lambda: force(self.explicate_effect(body, cont_block, basic_blocks)))
+                els = Promise(lambda: force(self.explicate_effect(orelse, cont_block, basic_blocks)))
                 return self.explicate_pred(test, thn, els, basic_blocks)
             case UnaryOp(_, operand):
                 return self.explicate_effect(operand, cont, basic_blocks)
@@ -326,39 +353,36 @@ class Compiler:
         self,
         rhs: expr,
         lhs: Name,
-        cont: list[stmt],
+        cont: Code,
         basic_blocks: dict[str, list[stmt]],
-    ) -> list[stmt]:
+    ) -> Code:
         match rhs:
             case Begin(stmts, result):
                 cont = self.explicate_assign(result, lhs, cont, basic_blocks)
-                for stmt in reversed(stmts):
-                    cont = self.explicate_stmt(stmt, cont, basic_blocks)
-                return cont
+                return self.explicate_stmts(stmts, cont, basic_blocks)
             case IfExp(test, body, orelse):
-                thn = self.explicate_assign(body, lhs, cont, basic_blocks)
-                els = self.explicate_assign(orelse, lhs, cont, basic_blocks)
+                cont_block = create_block(cont, basic_blocks)
+                thn = Promise(lambda: force(self.explicate_assign(body, lhs, cont_block, basic_blocks)))
+                els = Promise(lambda: force(self.explicate_assign(orelse, lhs, cont_block, basic_blocks)))
                 return self.explicate_pred(test, thn, els, basic_blocks)
             case _:
-                return [Assign([lhs], rhs)] + cont
+                return [Assign([lhs], rhs)] + force(cont)
 
     def explicate_pred(
         self,
         cnd: expr,
-        thn: list[stmt],
-        els: list[stmt],
+        thn: Code,
+        els: Code,
         basic_blocks: dict[str, list[stmt]],
-    ) -> list[stmt]:
+    ) -> Code:
         match cnd:
             case Begin(stmts, result):
                 cont = self.explicate_pred(result, thn, els, basic_blocks)
-                for stmt in reversed(stmts):
-                    cont = self.explicate_stmt(stmt, cont, basic_blocks)
-                return cont
-            case Compare(left, [op], [right]) as comparison:
-                return [If(comparison,
-                           self.create_block(thn, basic_blocks),
-                           self.create_block(els, basic_blocks))]
+                return self.explicate_stmts(stmts, cont, basic_blocks)
+            case Compare(left, [op], [right]):
+                return [If(cnd,
+                           force(create_block(thn, basic_blocks)),
+                           force(create_block(els, basic_blocks)))]
             case Constant(True):
                 return thn
             case Constant(False):
@@ -366,34 +390,33 @@ class Compiler:
             case UnaryOp(Not(), operand):
                 return self.explicate_pred(operand, els, thn, basic_blocks)
             case IfExp(test, body, orelse):
-                thn_code = self.explicate_pred(body, thn, els, basic_blocks)
-                els_code = self.explicate_pred(orelse, thn, els, basic_blocks)
+                thn_block = create_block(thn, basic_blocks)
+                els_block = create_block(els, basic_blocks)
+                thn_code = Promise(lambda: force(self.explicate_pred(body, thn_block, els_block, basic_blocks)))
+                els_code = Promise(lambda: force(self.explicate_pred(orelse, thn_block, els_block, basic_blocks)))
                 return self.explicate_pred(test, thn_code, els_code, basic_blocks)
             case Name(_):
                 comparison = Compare(cnd, [Eq()], [Constant(True)])
                 return [If(comparison,
-                           self.create_block(thn, basic_blocks),
-                           self.create_block(els, basic_blocks))]
+                           force(create_block(thn, basic_blocks)),
+                           force(create_block(els, basic_blocks)))]
             case _:
                 raise Exception('error in explicate_pred, unexpected ' + repr(cnd))
 
     def explicate_stmt(
-        self, s: stmt, cont: list[stmt], basic_blocks: dict[str, list[stmt]]
-    ) -> list[stmt]:
+        self, s: stmt, cont: Code, basic_blocks: dict[str, list[stmt]]
+    ) -> Code:
         match s:
             case Expr(Call(Name('print'), [arg])):
-                return [Expr(Call(Name('print'), [arg]))] + cont
+                return [Expr(Call(Name('print'), [arg]))] + force(cont)
             case Assign([lhs], rhs):
                 return self.explicate_assign(rhs, lhs, cont, basic_blocks)
             case Expr(value):
                 return self.explicate_effect(value, cont, basic_blocks)
             case If(test, body, orelse):
-                thn = cont
-                for s in reversed(body):
-                    thn = self.explicate_stmt(s, thn, basic_blocks)
-                els = cont
-                for s in reversed(orelse):
-                    els = self.explicate_stmt(s, els, basic_blocks)
+                cont_block = create_block(cont, basic_blocks)
+                thn = Promise(lambda: force(self.explicate_stmts(body, cont_block, basic_blocks)))
+                els = Promise(lambda: force(self.explicate_stmts(orelse, cont_block, basic_blocks)))
                 return self.explicate_pred(test, thn, els, basic_blocks)
             case _:
                 raise Exception('error in explicate_stmt, unexpected ' + repr(s))
@@ -405,7 +428,7 @@ class Compiler:
                 basic_blocks = {}
                 for s in reversed(body):
                     new_body = self.explicate_stmt(s, new_body, basic_blocks)
-                basic_blocks[label_name('start')] = new_body
+                basic_blocks[label_name('start')] = force(new_body)
                 return CProgram(basic_blocks)
             case _:
                 raise Exception('error in explicate_control, unexpected ' + repr(p))
