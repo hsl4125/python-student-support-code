@@ -299,6 +299,17 @@ class Compiler:
                 stmts = make_assigns(test_bindings)
                 stmts.append(If(test_expr, body_stmts, orelse_stmts))
                 return stmts
+            case While(test, body, []):
+                (test_expr, test_bindings) = self.rco_exp(test, False)
+                body_stmts = []
+                for stmt in body:
+                    body_stmts.extend(self.rco_stmt(stmt))
+                # Recompute the condition's temporary assignments at the end
+                # of each iteration so that the next test sees fresh values.
+                stmts = make_assigns(test_bindings)
+                body_stmts += make_assigns(test_bindings)
+                stmts.append(While(test_expr, body_stmts, []))
+                return stmts
             case _:
                 raise Exception('error in rco_stmt, unexpected ' + repr(s))
 

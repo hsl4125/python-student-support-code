@@ -23,7 +23,7 @@ typecheck_dict = {
     'source': type_check_Lwhile,
     #'partial_eval': type_check_Lwhile,
     'shrink': type_check_Lwhile,
-    #'remove_complex_operands': type_check_Lwhile,
+    'remove_complex_operands': type_check_Lwhile,
     #'explicate_control': type_check_Lwhile,
 }
 
@@ -32,7 +32,7 @@ interp_Lwhile = interp_Lwhile.InterpLwhile().interp
 interp_dict = {
     #'partial_eval': interp_Lwhile,
     'shrink': interp_Lwhile,
-    #'remove_complex_operands': interp_Lwhile,
+    'remove_complex_operands': interp_Lwhile,
     #'explicate_control': interpCif,
     #'select_instructions': interp_x86,
     #'assign_homes': interp_x86,
