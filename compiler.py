@@ -431,6 +431,18 @@ class Compiler:
                 thn = Promise(lambda: force(self.explicate_stmts(body, cont_block, basic_blocks)))
                 els = Promise(lambda: force(self.explicate_stmts(orelse, cont_block, basic_blocks)))
                 return self.explicate_pred(test, thn, els, basic_blocks)
+            case While(test, body, []):
+                # A while loop is explicated as:
+                #   loop_head:  if test: goto body_block else: goto cont
+                #   body_block: body; goto loop_head
+                # The condition is explicated with explicate_pred so that
+                # complex tests are evaluated before every iteration.
+                loop_head = label_name(generate_name('block'))
+                cont_block = create_block(cont, basic_blocks)
+                body_stmts = self.explicate_stmts(body, [Goto(loop_head)], basic_blocks)
+                basic_blocks[loop_head] = force(
+                    self.explicate_pred(test, body_stmts, cont_block, basic_blocks))
+                return [Goto(loop_head)]
             case _:
                 raise Exception('error in explicate_stmt, unexpected ' + repr(s))
 
