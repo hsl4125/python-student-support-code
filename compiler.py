@@ -1028,6 +1028,90 @@ class Compiler:
                 raise Exception('error in assign_homes, unexpected ' + repr(p))
 
     ############################################################################
+    # Remove Jumps
+    #
+    # Merge a basic block B into its unique predecessor P when P ends with
+    # `Jump(B)`.  The trailing jump is redundant because control already falls
+    # through from P into B's first instruction, so we delete the jump and
+    # append B's instructions to P.
+    ############################################################################
+
+    def remove_jumps(self, p: X86Program) -> X86Program:
+        """Merge a basic block into its unique predecessor.
+
+        Pseudocode:
+
+            edges = {}                       # block -> [(predecessor, kind)]
+            for each block P in body:
+                for instr in the last two instructions of P:
+                    if instr is Jump(t):      edges[t].append((P, 'jmp'))
+                    if instr is JumpIf(_, t): edges[t].append((P, 'jcc'))
+
+            changed = True
+            while changed:
+                changed = False
+                for each block B in body:
+                    (P, kind) = the single incoming edge of B, or skip
+                    if kind != 'jmp':         continue  # conditional: unsafe
+                    if P == B:                continue  # self loop
+                    if body[P][-1] != Jump(B): continue  # no fall through
+                    body[P] = body[P][:-1] + body[B]
+                    delete body[B]
+                    changed = True
+                    break
+            return p
+        """
+        match p:
+            case X86Program(body) if isinstance(body, dict):
+                while True:
+                    # Collect the incoming edges of every block so that we can
+                    # identify the blocks that have a unique predecessor.
+                    edges: dict[str, list[tuple[str, str]]] = {
+                        label: [] for label in body}
+                    for p_label, instrs in body.items():
+                        for i in instrs[-2:]:
+                            # Only edges to real blocks matter; `conclusion` is
+                            # a dangling label at this stage of the pipeline.
+                            if isinstance(i, Jump) and i.label in body:
+                                edges[i.label].append((p_label, 'jmp'))
+                            elif isinstance(i, JumpIf) and i.label in body:
+                                edges[i.label].append((p_label, 'jcc'))
+
+                    changed = False
+                    for b_label in list(body.keys()):
+                        incoming = edges[b_label]
+                        # A block with zero or several predecessors is a join
+                        # point (or unreachable), so it cannot be merged.
+                        if len(incoming) != 1:
+                            continue
+                        p_label, kind = incoming[0]
+                        # Merging a conditional jump would move the jump target
+                        # and change which branch is taken, so skip it.
+                        if kind != 'jmp':
+                            continue
+                        # A self loop cannot be inlined into itself.
+                        if p_label == b_label:
+                            continue
+                        # The predecessor must end with `jmp B`; otherwise
+                        # control would not fall through into B.
+                        if not body[p_label]:
+                            continue
+                        last = body[p_label][-1]
+                        if not (isinstance(last, Jump)
+                                and last.label == b_label):
+                            continue
+                        body[p_label] = body[p_label][:-1] + body[b_label]
+                        del body[b_label]
+                        changed = True
+                        # The edge map is stale after a merge; rebuild it.
+                        break
+                    if not changed:
+                        break
+                return p
+            case _:
+                raise Exception('error in remove_jumps, unexpected ' + repr(p))
+
+    ############################################################################
     # Patch Instructions
     ############################################################################
 

@@ -1451,6 +1451,16 @@ def compile_and_test(compiler, compiler_name,
             test_pass(passname, interp_dict, program_root, program,
                       compiler_name)
 
+    passname = 'remove_jumps'
+    if passname in interp_dict and hasattr(compiler, passname):
+        trace('\n# ' + passname + '\n')
+        program = compiler.remove_jumps(program)
+        trace(program)
+        total_passes += 1
+        successful_passes += \
+            test_pass(passname, interp_dict, program_root, program,
+                      compiler_name)
+
     passname = 'patch_instructions'
     if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
