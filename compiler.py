@@ -437,7 +437,7 @@ class Compiler:
                 #   body_block: body; goto loop_head
                 # The condition is explicated with explicate_pred so that
                 # complex tests are evaluated before every iteration.
-                loop_head = label_name(generate_name('block'))
+                loop_head = label_name(generate_name('loop_head'))
                 cont_block = create_block(cont, basic_blocks)
                 body_stmts = self.explicate_stmts(body, [Goto(loop_head)], basic_blocks)
                 basic_blocks[loop_head] = force(
