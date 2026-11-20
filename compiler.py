@@ -205,6 +205,8 @@ class Compiler:
                 return Assign([Name(id)], self.shrink_exp(exp))
             case If(exp, body, orelse):
                 return If(self.shrink_exp(exp), [self.shrink_stmt(s) for s in body], [self.shrink_stmt(s) for s in orelse])
+            case While(test, body, []):
+                return While(self.shrink_exp(test), [self.shrink_stmt(s) for s in body], [])
             case _:
                 raise Exception('error in shrink_stmt, unexpected ' + repr(s))
 
