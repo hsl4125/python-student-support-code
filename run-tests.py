@@ -34,11 +34,11 @@ interp_dict = {
     'shrink': interp_Lwhile,
     'remove_complex_operands': interp_Lwhile,
     'explicate_control': interp_Cif,
-    #'select_instructions': interp_x86,
-    #'assign_homes': interp_x86,
-    #'remove_jumps': interp_x86,
-    #'patch_instructions': interp_x86,
-    #'prelude_and_conclusion': interp_x86,
+    'select_instructions': interp_x86,
+    'assign_homes': interp_x86,
+    'remove_jumps': interp_x86,
+    'patch_instructions': interp_x86,
+    'prelude_and_conclusion': interp_x86,
 }
 
 if True:
@@ -46,7 +46,7 @@ if True:
               typecheck_dict,
               interp_dict)
 else:
-    run_one_test(os.getcwd() + '/tests/while/while-1.py',
+    run_one_test(os.getcwd() + '/tests/while/while-spill.py',
                  'while',
                  compiler,
                  'while',
