@@ -490,10 +490,16 @@ class Compiler:
         self, e: expr, cont: Code, basic_blocks: dict[str, list[stmt]]
     ) -> Code:
         match e:
-            case Constant(_) | Name(_):
+            case Constant(_) | Name(_) | GlobalValue(_):
                 return cont
             case Call(Name('input_int'), []) as call:
                 return [Expr(call)] + force(cont)
+            case Allocate(_, _) as alloc:
+                # Allocation mutates the heap, so keep it in effect position.
+                return [Expr(alloc)] + force(cont)
+            case Subscript(_, _, Load()) | Call(Name('len'), [_]):
+                # Tuple access and len are pure; their operands are atoms.
+                return cont
             case Begin(stmts, result):
                 cont = self.explicate_effect(result, cont, basic_blocks)
                 return self.explicate_stmts(stmts, cont, basic_blocks)
@@ -573,6 +579,11 @@ class Compiler:
         match s:
             case Expr(Call(Name('print'), [arg])):
                 return [Expr(Call(Name('print'), [arg]))] + force(cont)
+            case Assign([Subscript(tup, Constant(n), Store())], value):
+                # Tuple element store: a single C_Tup statement.  RCO
+                # guarantees that both the tuple expression and the value
+                # are atomic, so no further explication is needed.
+                return [s] + force(cont)
             case Assign([lhs], rhs):
                 return self.explicate_assign(rhs, lhs, cont, basic_blocks)
             case Expr(value):
@@ -594,6 +605,8 @@ class Compiler:
                 basic_blocks[loop_head] = force(
                     self.explicate_pred(test, body_stmts, cont_block, basic_blocks))
                 return [Goto(loop_head)]
+            case Collect(n):
+                return [Collect(n)] + force(cont)
             case _:
                 raise Exception('error in explicate_stmt, unexpected ' + repr(s))
 
