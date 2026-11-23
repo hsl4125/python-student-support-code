@@ -27,7 +27,7 @@ typecheck_dict = {
     #'partial_eval': type_check_Lwhile,
     'shrink': type_check_Ltuple,
     'expose_allocation': type_check_Ltuple,
-    #'remove_complex_operands': type_check_Lwhile,
+    'remove_complex_operands': type_check_Ltuple,
     #'explicate_control': type_check_Cif,
 }
 
@@ -38,7 +38,7 @@ interp_dict = {
     #'partial_eval': interp_Lwhile,
     'shrink': interp_Ltup,
     'expose_allocation': interp_Ltup,
-    #'remove_complex_operands': interp_Ltup,
+    'remove_complex_operands': interp_Ltup,
     #'explicate_control': interp_Ltup,
     #'select_instructions': interp_x86,
     #'assign_homes': interp_x86,

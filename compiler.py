@@ -208,6 +208,9 @@ class Compiler:
                 return Expr(self.shrink_exp(exp))
             case Assign([Name(id)], exp):
                 return Assign([Name(id)], self.shrink_exp(exp))
+            case Assign([Subscript(tup, Constant(n), Store())], value):
+                return Assign([Subscript(self.shrink_exp(tup), Constant(n), Store())],
+                              self.shrink_exp(value))
             case If(exp, body, orelse):
                 return If(self.shrink_exp(exp), [self.shrink_stmt(s) for s in body], [self.shrink_stmt(s) for s in orelse])
             case While(test, body, []):
@@ -344,8 +347,14 @@ class Compiler:
                 return (constant, [])
             case Name(id) as var:
                 return (var, [])
+            case GlobalValue(var) as g:
+                return (g, [])
             case Call(Name('input_int'), []) as call:
                 return finish_rco(call, [])
+            case Call(Name('len'), [exp]):
+                (arg, bindings) = self.rco_exp(exp, True)
+                call = Call(Name('len'), [arg])
+                return finish_rco(call, bindings)
             case UnaryOp(op, exp):
                 (operand, bindings) = self.rco_exp(exp, True)
                 result = UnaryOp(op, operand)
@@ -375,6 +384,30 @@ class Compiler:
                     make_begin(orelse_bindings, orelse_name),
                 )
                 return finish_rco(result, [])
+            case Allocate(n, t) as alloc:
+                return finish_rco(alloc, [])
+            case Subscript(exp, Constant(n), Load()):
+                (tup_name, tup_bindings) = self.rco_exp(exp, True)
+                r = Subscript(tup_name, Constant(n), Load())
+                return finish_rco(r, tup_bindings)
+            case Begin(ss, result_exp):
+                # Remove complex operands from the begin's statements and
+                # from its result expression.  The result's temporaries must
+                # be run *inside* the begin, after the statements, because
+                # the statements have side effects (collect, tuple stores)
+                # that must happen before the result is computed.
+                body: List[stmt] = []
+                for s in ss:
+                    body.extend(self.rco_stmt(s))
+                (r, bs) = self.rco_exp(result_exp, need_atomic)
+                if need_atomic:
+                    if not body:
+                        return (r, bs)
+                    body += make_assigns(bs)
+                    tmp = Name(generate_name('tmp'))
+                    return (tmp, [(tmp, Begin(body, r))])
+                body += make_assigns(bs)
+                return (Begin(body, r), [])
             case _:
                 raise Exception('error in rco_exp, unexpected ' + repr(e))
 
@@ -417,6 +450,17 @@ class Compiler:
                 body_stmts += make_assigns(test_bindings)
                 stmts.append(While(test_expr, body_stmts, []))
                 return stmts
+            case Assign([Subscript(tup, Constant(n), Store())], value):
+                # The tuple expression is evaluated before the right-hand
+                # side, and both must be atomic in the output language.
+                (tup_expr, tup_bindings) = self.rco_exp(tup, True)
+                (value_expr, value_bindings) = self.rco_exp(value, True)
+                stmts = make_assigns(tup_bindings)
+                stmts += make_assigns(value_bindings)
+                stmts.append(Assign([Subscript(tup_expr, Constant(n), Store())], value_expr))
+                return stmts
+            case Collect(n):
+                return [Collect(n)]
             case _:
                 raise Exception('error in rco_stmt, unexpected ' + repr(s))
 
