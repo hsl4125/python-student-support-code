@@ -26,6 +26,7 @@ typecheck_dict = {
     'source': type_check_Ltuple,
     #'partial_eval': type_check_Lwhile,
     'shrink': type_check_Ltuple,
+    'expose_allocation': type_check_Ltuple,
     #'remove_complex_operands': type_check_Lwhile,
     #'explicate_control': type_check_Cif,
 }
@@ -36,6 +37,7 @@ interp_Ltup = interp_Ltup.InterpLtup().interp
 interp_dict = {
     #'partial_eval': interp_Lwhile,
     'shrink': interp_Ltup,
+    'expose_allocation': interp_Ltup,
     #'remove_complex_operands': interp_Ltup,
     #'explicate_control': interp_Ltup,
     #'select_instructions': interp_x86,

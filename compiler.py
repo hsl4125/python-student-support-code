@@ -227,6 +227,108 @@ class Compiler:
                 raise Exception('error in shrink, unexpected ' + repr(p))
 
     ############################################################################
+    # Expose Allocation
+    ############################################################################
+    # Lower tuple creation into the explicit allocation protocol of L_Alloc:
+    #
+    #   (e0, ..., e_{n-1})  ==>  begin
+    #                              init.0 = e0
+    #                              ...
+    #                              init.n-1 = e_{n-1}
+    #                              if global_value(free_ptr) + bytes < global_value(fromspace_end):
+    #                              else:
+    #                                  collect(bytes)
+    #                              alloc.k = allocate(n, tuple_type)
+    #                              alloc.k[0] = init.0
+    #                              ...
+    #                              alloc.k[n-1] = init.n-1
+    #                              alloc.k
+    #                            end
+    #
+    # where bytes = 8 * (n + 1): eight bytes for the tuple's tag plus eight
+    # bytes per element.  The initializers are evaluated (into temporaries)
+    # before the allocation because a tuple may trigger the garbage collector,
+    # and the collector must never observe an allocated but uninitialized tuple.
+    def expose_alloc_exp(self, e: expr) -> expr:
+        match  e:
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.expose_alloc_exp(operand))
+            case BinOp(left, op, right):
+                return BinOp(self.expose_alloc_exp(left), op, self.expose_alloc_exp(right))
+            case Compare(left, ops, comparators):
+                return Compare(self.expose_alloc_exp(left), ops,
+                               [self.expose_alloc_exp(comparator) for comparator in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(self.expose_alloc_exp(test), self.expose_alloc_exp(body),
+                             self.expose_alloc_exp(orelse))
+            case Call(func, args):
+                return Call(self.expose_alloc_exp(func),
+                            [self.expose_alloc_exp(arg) for arg in args])
+            case Begin(body, result):
+                return Begin(self.expose_alloc_stmts(body), self.expose_alloc_exp(result))
+            case Tuple(es, Load()):
+                if not hasattr(e, 'has_type'):
+                    raise ValueError('expose_alloc_exp: tuple is missing has_type; '
+                                     'run the type checker before expose_allocation')
+                # 1. Evaluate the initializers left to right into temporaries.
+                init_names = []
+                stmts: list[stmt] = []
+                for init in es:
+                    name = generate_name('init')
+                    init_names.append(name)
+                    stmts.append(Assign([Name(name)], self.expose_alloc_exp(init)))
+                # 2. Collect only when there is not enough room in the from-space.
+                bytes = 8 * (len(es) + 1)
+                cond = Compare(BinOp(GlobalValue('free_ptr'), Add(), Constant(bytes)),
+                               [Lt()], [GlobalValue('fromspace_end')])
+                stmts.append(If(cond, [], [Collect(bytes)]))
+                # 3. Allocate the tuple and initialize its elements.
+                alloc = generate_name('alloc')
+                stmts.append(Assign([Name(alloc)], Allocate(len(es), e.has_type)))
+                for index, name in enumerate(init_names):
+                    stmts.append(Assign([Subscript(Name(alloc), Constant(index), Store())],
+                                        Name(name)))
+                return Begin(stmts, Name(alloc))
+            case Subscript(exp, Constant(index), Load()):
+                return Subscript(self.expose_alloc_exp(exp), Constant(index), Load())
+            case Constant(_) | Name(_) | GlobalValue(_) | Allocate(_, _):
+                return e
+            case _:
+                raise Exception('error in expose_alloc_exp, unexpected ' + repr(e))
+
+    def expose_alloc_stmts(self, ss: list[stmt]) -> list[stmt]:
+        return [self.expose_alloc_stmt(s) for s in ss]
+
+    def expose_alloc_stmt(self, s: stmt) -> stmt:
+        match s:
+            case Expr(exp):
+                return Expr(self.expose_alloc_exp(exp))
+            case Assign([Name(id)], exp):
+                return Assign([Name(id)], self.expose_alloc_exp(exp))
+            case Assign([Subscript(tup, Constant(index), Store())], value):
+                return Assign([Subscript(self.expose_alloc_exp(tup),
+                                         Constant(index), Store())],
+                              self.expose_alloc_exp(value))
+            case If(test, body, orelse):
+                return If(self.expose_alloc_exp(test),
+                          self.expose_alloc_stmts(body),
+                          self.expose_alloc_stmts(orelse))
+            case While(test, body, []):
+                return While(self.expose_alloc_exp(test),
+                             self.expose_alloc_stmts(body), [])
+            case Collect(size):
+                return Collect(size)
+            case _:
+                raise Exception('error in expose_alloc_stmt, unexpected ' + repr(s))
+
+    def expose_allocation(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                return Module(self.expose_alloc_stmts(body))
+            case _:
+                raise Exception('error in expose_allocation, unexpected ' + repr(p))
+
+    ############################################################################
     # Remove Complex Operands
     ############################################################################
 
