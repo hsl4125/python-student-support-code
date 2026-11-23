@@ -638,6 +638,8 @@ class Compiler:
                 return Immediate(value)
             case Name(id):
                 return Variable(id)
+            case GlobalValue(var):
+                return Global(var)
             case _:
                 raise Exception('error in select_arg, unexpected ' + repr(e))
 
@@ -653,6 +655,12 @@ class Compiler:
                 return []
             case Compare(_, [_], [_]):
                 return []
+            case GlobalValue(_) | Subscript(_, _, Load()) | Call(Name('len'), [_]):
+                # These expressions are pure, so they have no effect when
+                # used as a statement.
+                return []
+            case Allocate(_, _) as alloc:
+                return self.select_assign_into(Reg('rax'), alloc)
             case _:
                 raise Exception('error in select_exp_into, unexpected ' + repr(e))
 
@@ -670,8 +678,29 @@ class Compiler:
                 return 'g'
             case GtE():
                 return 'ge'
+            case Is():
+                # Comparing two tuple pointers with `is` is an equality
+                # comparison on the addresses.
+                return 'e'
             case _:
                 raise Exception('error in select_cc, unexpected ' + repr(op))
+
+    def tuple_tag(self, ty: Type) -> int:
+        # The tag of a tuple (see section 7.2.3) has the following layout:
+        #   bit 0     : set to 1 when the tuple has not been copied yet
+        #   bits 1-6  : the length of the tuple
+        #   bits 7-56 : a pointer mask, one bit per element, set to 1 when
+        #               the element is (or may be) a tuple pointer
+        if not isinstance(ty, TupleType):
+            raise ValueError('tuple_tag: expected a TupleType, got ' + repr(ty))
+        types = ty.types
+        if len(types) > 50:
+            raise ValueError('tuple_tag: tuples may have at most 50 elements')
+        mask = 0
+        for (i, t) in enumerate(types):
+            if isinstance(t, TupleType):
+                mask = mask | (1 << i)
+        return (mask << 7) | (len(types) << 1) | 1
 
     def select_assign_into(self, lhs: Name | Reg, exp: expr) -> List[instr]:
         target = lhs if isinstance(lhs, Reg) else self.select_arg(lhs)
@@ -688,6 +717,18 @@ class Compiler:
                     Callq('read_int', 0),
                     Instr('movq', [Reg('rax'), target]),
                 ]
+            case Call(Name('len'), [arg]):
+                # The length is stored in bits 1-6 of the tuple's tag.
+                src = self.select_arg(arg)
+                instrs = []
+                if src != Reg('r11'):
+                    instrs.append(Instr('movq', [src, Reg('r11')]))
+                instrs.extend([
+                    Instr('movq', [Deref('r11', 0), target]),
+                    Instr('andq', [Immediate(126), target]),
+                    Instr('sarq', [Immediate(1), target]),
+                ])
+                return instrs
             case UnaryOp(USub(), atm):
                 src = self.select_arg(atm)
                 instrs = []
@@ -738,6 +779,26 @@ class Compiler:
                     Instr('set' + cc, [ByteReg('al')]),
                     Instr('movzbq', [ByteReg('al'), target]),
                 ]
+            case Subscript(tup, Constant(n), Load()):
+                # Skip the 8-byte tag, then read the n-th element.
+                tup_arg = self.select_arg(tup)
+                instrs = []
+                if tup_arg != Reg('r11'):
+                    instrs.append(Instr('movq', [tup_arg, Reg('r11')]))
+                instrs.append(Instr('movq', [Deref('r11', 8 * (n + 1)), target]))
+                return instrs
+            case Allocate(n, ty):
+                # Inline allocation: bump free_ptr and write the tag.  The
+                # tuple starts out uninitialized (filled in by later stores).
+                tag = self.tuple_tag(ty)
+                instrs = [
+                    Instr('movq', [Global('free_ptr'), Reg('r11')]),
+                    Instr('addq', [Immediate(8 * (n + 1)), Global('free_ptr')]),
+                    Instr('movq', [Immediate(tag), Deref('r11', 0)]),
+                ]
+                if target != Reg('r11'):
+                    instrs.append(Instr('movq', [Reg('r11'), target]))
+                return instrs
             case _:
                 raise Exception(
                     'error in select_assign_into, unexpected ' + repr(exp)
@@ -775,8 +836,27 @@ class Compiler:
                 ]
             case Expr(exp):
                 return self.select_exp_into(exp)
+            case Assign([Subscript(tup, Constant(n), Store())], value):
+                # Skip the 8-byte tag, then write the n-th element.
+                tup_arg = self.select_arg(tup)
+                value_arg = self.select_arg(value)
+                instrs = []
+                if tup_arg != Reg('r11'):
+                    instrs.append(Instr('movq', [tup_arg, Reg('r11')]))
+                instrs.append(
+                    Instr('movq', [value_arg, Deref('r11', 8 * (n + 1))])
+                )
+                return instrs
             case Assign([lhs], exp):
                 return self.select_assign_into(lhs, exp)
+            case Collect(n):
+                # The collector takes the root stack pointer and the number
+                # of bytes requested.
+                return [
+                    Instr('movq', [Reg('r15'), Reg('rdi')]),
+                    Instr('movq', [Immediate(n), Reg('rsi')]),
+                    Callq('collect', 2),
+                ]
             case _:
                 raise Exception('error in select_stmt, unexpected ' + repr(s))
 

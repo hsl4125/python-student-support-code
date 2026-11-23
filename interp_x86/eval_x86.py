@@ -30,7 +30,14 @@ class X86Emulator:
         self.registers['rbp'] = 1000
         self.registers['rsp'] = 1000
 
-        self.global_vals = {}
+        # Defaults for the heap-management globals used by the x86 Global
+        # language (chapter 7).  A program with a prelude calls initialize,
+        # which replaces these values with the real heap bounds.
+        self.global_vals = {
+            'free_ptr': 0,
+            'fromspace_begin': 0,
+            'fromspace_end': 1 << 40,
+        }
 
     def log(self, s):
         if self.logging:
@@ -253,6 +260,18 @@ class X86Emulator:
                 v1 = self.eval_arg(a1)
                 v2 = self.eval_arg(a2)
                 self.store_arg(a2, xor64(v1, v2))
+
+            elif instr.data == 'andq':
+                a1, a2 = instr.children
+                v1 = self.eval_arg(a1)
+                v2 = self.eval_arg(a2)
+                self.store_arg(a2, v1 & v2)
+
+            elif instr.data == 'sarq':
+                a1, a2 = instr.children
+                v1 = self.eval_arg(a1)
+                v2 = self.eval_arg(a2)
+                self.store_arg(a2, v2 >> v1)
 
             elif instr.data == 'negq':
                 a1 = instr.children[0]

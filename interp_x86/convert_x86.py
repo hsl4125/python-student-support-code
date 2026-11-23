@@ -29,6 +29,10 @@ def convert_arg(arg):
             return Tree('reg_a', [id])
         case GlobalValue(id):
             return Tree('global_val_a', [id, 'rip'])
+        case Global(name):
+            # A Global is a reference to the memory cell named by a label
+            # (chapter 7's x86 Global language).
+            return Tree('global_val_a', [name, 'rip'])
         case _:
             raise Exception('convert_arg: unhandled ' + repr(arg))
 
