@@ -4,11 +4,11 @@ import typing
 from utils import *
 from x86_ast import *
 import os
-from typing import List, Tuple, Set, Dict
+from typing import List, Set, Dict
 from graph import *
 from dataflow_analysis import analyze_dataflow
 
-Binding = Tuple[Name, expr]
+Binding = typing.Tuple[Name, expr]
 Temporaries = List[Binding]
 
 
@@ -191,6 +191,10 @@ class Compiler:
             case Call(func, args):
                 return Call(self.shrink_exp(func),
                             [self.shrink_exp(arg) for arg in args])
+            case Tuple(es, Load()):
+                return Tuple([self.shrink_exp(exp) for exp in es], Load())
+            case Subscript(exp, Constant(int), Load()):
+                return Subscript(self.shrink_exp(exp), Constant(int), Load())
             case Constant(_) | Name(_):
                 return e
             case _:
