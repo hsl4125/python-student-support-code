@@ -29,6 +29,10 @@ class X86Emulator:
         self.logging = logging
         self.registers['rbp'] = 1000
         self.registers['rsp'] = 1000
+        # Root-stack pointer for programs that have not run the prelude yet;
+        # 2000 matches the rootstack_begin that initialize() hands out.  A
+        # program with a prelude overwrites it with the real value (7.8).
+        self.registers['r15'] = 2000
 
         # Defaults for the heap-management globals used by the x86 Global
         # language (chapter 7).  A program with a prelude calls initialize,

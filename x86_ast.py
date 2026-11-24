@@ -4,7 +4,7 @@ import ast
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from utils import dedent, indent, indent_stmt, label_name
+from utils import Type, dedent, indent, indent_stmt, label_name
 
 
 @dataclass
@@ -12,6 +12,12 @@ class X86Program:
     body: dict[str, list[instr]] | list[instr]
     stack_size: int = 0
     used_callee: list[Reg] = field(default_factory=list)
+    # Section 7.7: variable name -> Type, recorded by the C_Tup type
+    # checker and carried through select_instructions.  The register
+    # allocator uses it to decide which spills belong on the root stack.
+    # root_stack_size is the number of bytes reserved there for them.
+    var_types: dict[str, Type] = field(default_factory=dict)
+    root_stack_size: int = 0
 
     def __str__(self):
         result = ''

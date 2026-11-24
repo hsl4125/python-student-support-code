@@ -872,7 +872,13 @@ class Compiler:
                         instructions.extend(self.select_stmt(stmt))
                     instructions.extend(self.select_tail(block[-1]))
                     x86_blocks[label] = instructions
-                return X86Program(x86_blocks)
+                result = X86Program(x86_blocks)
+                # The register allocator needs variable types (section 7.7):
+                # a spilled tuple-typed variable must live on the root stack so
+                # that the garbage collector can see it.  The C_Tup type checker
+                # stored them on the CProgram before this pass ran.
+                result.var_types = dict(getattr(p, 'var_types', {}))
+                return result
             case _:
                 raise Exception('error in select_instructions, unexpected ' + repr(p))
 
@@ -1061,8 +1067,10 @@ class Compiler:
         self,
         blocks: dict[str, list[instr]],
         live_after: dict[instr, set[location]],
+        var_types: typing.Optional[dict[str, Type]] = None,
     ) -> UndirectedAdjList:
         g = UndirectedAdjList()
+        types = var_types if var_types is not None else {}
 
         for vertex in self.all_home_vars(blocks):
             g.add_vertex(vertex)
@@ -1079,6 +1087,27 @@ class Compiler:
                         for v in lafter:
                             if v not in (src, d):
                                 add_edge(d, v)
+                case Callq('collect', _):
+                    # The usual rule: the call writes the caller-saved
+                    # registers, so they conflict with everything live after.
+                    for d in w:
+                        for v in lafter:
+                            if d != v:
+                                add_edge(d, v)
+                    # GC rule (section 7.7): a tuple-typed variable that is
+                    # live across a call to collect must be spilled so the
+                    # collector can find it on the root stack.  Making it
+                    # conflict with every callee-saved register leaves it no
+                    # register to live in (the caller-saved ones already
+                    # conflict), so graph coloring is forced to spill it.
+                    # r15 holds the root-stack pointer and is not an
+                    # assignable color, so it is intentionally excluded.
+                    for v in lafter:
+                        if (isinstance(v, Variable)
+                                and isinstance(types.get(v.id), TupleType)):
+                            for r in [Reg('rbx'), Reg('r12'),
+                                      Reg('r13'), Reg('r14')]:
+                                add_edge(v, r)
                 case _:
                     for d in w:
                         for v in lafter:
@@ -1264,9 +1293,34 @@ class Compiler:
                 homes = self.all_home_vars(body)
                 live_after = self.uncover_live(body)
 
-                interference = self.build_interference(body, live_after)
+                interference = self.build_interference(
+                    body, live_after, p.var_types)
                 move_graph = self.move_related_graph(homes, body)
                 home = self.allocate_registers(interference, move_graph, p)
+
+                # Section 7.7: ordinary spills live below %rbp, but
+                # tuple-typed spills must live on the root stack -- the only
+                # stack the collector scans.  r15 points just past the
+                # reserved root-stack area (the prelude sets it up in 7.8),
+                # so the k-th slot is -8*k(%r15).
+                #
+                # pseudocode:
+                #   root = 0
+                #   for v in sorted(home):                # deterministic order
+                #       if home[v] is an rbp spill and var_types[v] is a tuple:
+                #           root += 1; home[v] = Deref('r15', -8 * root)
+                #   p.root_stack_size = 8 * root
+                root_spills = 0
+                for variable in sorted(home, key=lambda v: v.id):
+                    location = home[variable]
+                    if (isinstance(location, Deref)
+                            and location.reg == 'rbp'
+                            and location.offset < 0
+                            and isinstance(p.var_types.get(variable.id),
+                                           TupleType)):
+                        root_spills += 1
+                        home[variable] = Deref('r15', -8 * root_spills)
+                p.root_stack_size = 8 * root_spills
 
                 def assign_arg(a: arg) -> arg:
                     if isinstance(a, Variable):
