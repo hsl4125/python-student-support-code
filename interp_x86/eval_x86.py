@@ -277,6 +277,27 @@ class X86Emulator:
                 v2 = self.eval_arg(a2)
                 self.store_arg(a2, v2 >> v1)
 
+            elif instr.data == 'shlq':
+                a1, a2 = instr.children
+                v1 = self.eval_arg(a1)
+                v2 = self.eval_arg(a2)
+                # x86 shifts wrap around 64 bits, whereas Python integers
+                # grow without bound, so mask the result.
+                self.store_arg(a2, (v2 << v1) & 0xFFFFFFFFFFFFFFFF)
+
+            elif instr.data == 'shrq':
+                a1, a2 = instr.children
+                v1 = self.eval_arg(a1)
+                v2 = self.eval_arg(a2)
+                # Logical (unsigned) right shift over the 64-bit word.
+                self.store_arg(a2, (v2 & 0xFFFFFFFFFFFFFFFF) >> v1)
+
+            elif instr.data == 'imulq':
+                a1, a2 = instr.children
+                v1 = self.eval_arg(a1)
+                v2 = self.eval_arg(a2)
+                self.store_arg(a2, v1 * v2)
+
             elif instr.data == 'negq':
                 a1 = instr.children[0]
                 v1 = self.eval_arg(a1)

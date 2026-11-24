@@ -124,11 +124,10 @@ class PreludeConclusionTests(unittest.TestCase):
                 'movq $16, %rsi',
                 'callq initialize',
                 'movq rootstack_begin(%rip), %r15',
-                'movq %r15, %rdi',
-                'movq $0, %rax',
-                'movq $2, %rcx',
-                'rep stosq',
-                'addq $16, %r15',
+                'movq $0, 0(%r15)',
+                'addq $8, %r15',
+                'movq $0, 0(%r15)',
+                'addq $8, %r15',
                 'jmp start',
             ],
         )
@@ -146,8 +145,8 @@ class PreludeConclusionTests(unittest.TestCase):
     def test_large_root_stack_still_uses_minimum_size(self):
         # ROOTSTACK_INIT_SIZE (8192 slots) is a floor: a larger
         # root_stack_size must be rounded up to a multiple of 64 and still
-        # leave a strict margin below rootstack_end.  Zeroing stays a single
-        # REP STOSQ regardless of the slot count.
+        # leave a strict margin below rootstack_end.  Zeroing emits one
+        # movq/addq pair per reserved slot.
         root_stack_size = 32768
         program = X86Program(
             {'start': [Instr('retq', [])]},
@@ -158,12 +157,17 @@ class PreludeConclusionTests(unittest.TestCase):
 
         main = instr_strings(patched.body['main'])
         self.assertIn('movq $65536, %rdi', main)
-        self.assertIn('movq $4096, %rcx', main)
-        self.assertIn('rep stosq', main)
-        self.assertIn('addq $32768, %r15', main)
-        self.assertFalse(
-            [s for s in main
-             if s.startswith('movq $0, ') and s.endswith('(%r15)')])
+        self.assertNotIn('rep stosq', main)
+        self.assertNotIn('movq $4096, %rcx', main)
+        self.assertNotIn('addq $32768, %r15', main)
+        self.assertEqual(
+            main.count('movq $0, 0(%r15)'),
+            root_stack_size // 8,
+        )
+        self.assertEqual(
+            main.count('addq $8, %r15'),
+            root_stack_size // 8,
+        )
         self.assertEqual(
             instr_strings(patched.body['conclusion'])[0],
             'subq $32768, %r15',

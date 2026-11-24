@@ -156,21 +156,33 @@ void initialize(uint64_t rootstack_size, uint64_t heap_size)
 void validate_vector(int64_t** scan_addr) {
   int64_t* scan_ptr = *scan_addr;
   int64_t tag = *scan_ptr;
+  // Tuples (vec) and arrays (vecof) use different tag layouts, but the
+  // debug validation is the same: skip the tag word and make sure every
+  // field that is a pointer refers to an object in fromspace.
+  uint64_t len;
+  int64_t isPtrBits;
+  int all_pointers = 0;
   if (is_vecof(tag)) {
-    exit(EXIT_FAILURE);
+    // Arrays store a 60-bit length in bits [2,61] and a single bit that
+    // says whether every element is a pointer.
+    len = get_vecof_length(tag);
+    isPtrBits = 0;
+    all_pointers = get_vecof_ptr_bitfield(tag);
   } else {
-    unsigned char len = get_vector_length(tag);
-    int64_t isPtrBits = get_vec_ptr_bitfield(tag);
-    int64_t* data = scan_ptr + 1;
-    *scan_addr = scan_ptr + len + 1;
-    for (unsigned char i = 0; i != len; i++){
-      if ((isPtrBits >> i) & 1){
-        int64_t* ptr = (int64_t*) data[i];
-        if (is_ptr(ptr)) {
-          int64_t* real_ptr = to_ptr(ptr);
-          assert(real_ptr < fromspace_end);
-          assert(real_ptr >= fromspace_begin);
-        }
+    // Tuples store a 6-bit length in bits [1,6] and one pointer bit per
+    // element in the higher bits.
+    len = get_vector_length(tag);
+    isPtrBits = get_vec_ptr_bitfield(tag);
+  }
+  int64_t* data = scan_ptr + 1;
+  *scan_addr = scan_ptr + len + 1;
+  for (uint64_t i = 0; i != len; i++) {
+    if (all_pointers || ((isPtrBits >> i) & 1)) {
+      int64_t* ptr = (int64_t*)data[i];
+      if (is_ptr(ptr)) {
+        int64_t* real_ptr = to_ptr(ptr);
+        assert(real_ptr < fromspace_end);
+        assert(real_ptr >= fromspace_begin);
       }
     }
   }

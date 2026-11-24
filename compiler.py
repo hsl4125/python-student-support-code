@@ -4,12 +4,11 @@ import typing
 from utils import *
 from x86_ast import *
 import os
-from typing import List, Set, Dict
 from graph import *
 from dataflow_analysis import analyze_dataflow
 
 Binding = typing.Tuple[Name, expr]
-Temporaries = List[Binding]
+Temporaries = typing.List[Binding]
 
 
 @dataclass
@@ -193,8 +192,10 @@ class Compiler:
                             [self.shrink_exp(arg) for arg in args])
             case Tuple(es, Load()):
                 return Tuple([self.shrink_exp(exp) for exp in es], Load())
-            case Subscript(exp, Constant(int), Load()):
-                return Subscript(self.shrink_exp(exp), Constant(int), Load())
+            case List(es, Load()):
+                return List([self.shrink_exp(exp) for exp in es], Load())
+            case Subscript(exp, index, Load()):
+                return Subscript(self.shrink_exp(exp), self.shrink_exp(index), Load())
             case Constant(_) | Name(_):
                 return e
             case _:
@@ -208,8 +209,9 @@ class Compiler:
                 return Expr(self.shrink_exp(exp))
             case Assign([Name(id)], exp):
                 return Assign([Name(id)], self.shrink_exp(exp))
-            case Assign([Subscript(tup, Constant(n), Store())], value):
-                return Assign([Subscript(self.shrink_exp(tup), Constant(n), Store())],
+            case Assign([Subscript(tup, index, Store())], value):
+                return Assign([Subscript(self.shrink_exp(tup),
+                                         self.shrink_exp(index), Store())],
                               self.shrink_exp(value))
             case If(exp, body, orelse):
                 return If(self.shrink_exp(exp), [self.shrink_stmt(s) for s in body], [self.shrink_stmt(s) for s in orelse])
@@ -228,6 +230,222 @@ class Compiler:
                 return Module(stmts)
             case _:
                 raise Exception('error in shrink, unexpected ' + repr(p))
+
+    ############################################################################
+    # Overload Resolution
+    ############################################################################
+    # The L_Array language overloads several operators:
+    #
+    #   A[i]      reads an element of an array when A has list type, and an
+    #             element of a tuple when A has tuple type
+    #   A[i] = v  writes an array element or a tuple element
+    #   len(A)    computes the length of an array or of a tuple
+    #
+    # The L_Array type checker stores ListType(...) or TupleType(...) in the
+    # has_type field of the expressions it checks, so this pass can resolve
+    # every overload by inspecting has_type:
+    #
+    #   array load      ==>  array_load(A, i)
+    #   array store     ==>  array_store(A, i, v)
+    #   len(array)      ==>  array_len(A)
+    #
+    # Tuple operations are left unchanged.
+    def resolve_exp(self, e: expr) -> expr:
+        match e:
+            case Subscript(base, index, Load()):
+                base_ty = getattr(base, 'has_type', None)
+                if base_ty is None:
+                    raise ValueError('resolve: subscript base is missing has_type; '
+                                     'run the type checker before resolve')
+                base2 = self.resolve_exp(base)
+                index2 = self.resolve_exp(index)
+                if isinstance(base_ty, ListType):
+                    return Call(Name('array_load'), [base2, index2])
+                return Subscript(base2, index2, Load())
+            case Call(Name('len'), [arg]):
+                arg_ty = getattr(arg, 'has_type', None)
+                if arg_ty is None:
+                    raise ValueError('resolve: len argument is missing has_type; '
+                                     'run the type checker before resolve')
+                arg2 = self.resolve_exp(arg)
+                if isinstance(arg_ty, ListType):
+                    return Call(Name('array_len'), [arg2])
+                return Call(Name('len'), [arg2])
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.resolve_exp(operand))
+            case BinOp(left, op, right):
+                return BinOp(self.resolve_exp(left), op, self.resolve_exp(right))
+            case Compare(left, ops, comparators):
+                return Compare(self.resolve_exp(left), ops,
+                               [self.resolve_exp(c) for c in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(self.resolve_exp(test), self.resolve_exp(body),
+                             self.resolve_exp(orelse))
+            case Tuple(es, Load()):
+                return Tuple([self.resolve_exp(x) for x in es], Load())
+            case List(es, Load()):
+                return List([self.resolve_exp(x) for x in es], Load())
+            case Call(func, args):
+                return Call(self.resolve_exp(func),
+                            [self.resolve_exp(a) for a in args])
+            case Begin(body, result):
+                return Begin(self.resolve_stmts(body), self.resolve_exp(result))
+            case Constant(_) | Name(_) | GlobalValue(_) \
+                    | Allocate(_, _) | AllocateArray(_, _):
+                return e
+            case _:
+                raise Exception('error in resolve_exp, unexpected ' + repr(e))
+
+    def resolve_stmt(self, s: stmt) -> stmt:
+        match s:
+            case Assign([Subscript(base, index, Store())], value):
+                base_ty = getattr(base, 'has_type', None)
+                if isinstance(base_ty, ListType):
+                    # An array element write becomes the array_store primitive.
+                    return Expr(Call(Name('array_store'),
+                                     [self.resolve_exp(base),
+                                      self.resolve_exp(index),
+                                      self.resolve_exp(value)]))
+                return Assign([Subscript(self.resolve_exp(base),
+                                         self.resolve_exp(index), Store())],
+                              self.resolve_exp(value))
+            case Expr(exp):
+                return Expr(self.resolve_exp(exp))
+            case Assign([Name(id)], exp):
+                return Assign([Name(id)], self.resolve_exp(exp))
+            case If(test, body, orelse):
+                return If(self.resolve_exp(test), self.resolve_stmts(body),
+                          self.resolve_stmts(orelse))
+            case While(test, body, []):
+                return While(self.resolve_exp(test), self.resolve_stmts(body), [])
+            case _:
+                raise Exception('error in resolve_stmt, unexpected ' + repr(s))
+
+    def resolve_stmts(self, ss: list[stmt]) -> list[stmt]:
+        return [self.resolve_stmt(s) for s in ss]
+
+    def resolve(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                return Module(self.resolve_stmts(body))
+            case _:
+                raise Exception('error in resolve, unexpected ' + repr(p))
+
+    ############################################################################
+    # Check Bounds
+    ############################################################################
+    # An array access can be out of bounds at run time, whereas the reference
+    # interpreter signals TrappedError.  The compiled program must therefore
+    # check the index before each access and halt on failure.  For
+    #
+    #   array_load(A, i)          and          array_store(A, i, v)
+    #
+    # this pass generates
+    #
+    #   begin:
+    #     t.0 = A
+    #     t.1 = i
+    #     t.2 = array_len(t.0)
+    #     if t.1 >= 0:                          # the index must not be negative
+    #       if t.1 < t.2:                       # and it must be in range
+    #         array_load(t.0, t.1)              # or array_store(t.0, t.1, v)
+    #       else: exit()
+    #     else: exit()
+    #   end
+    #
+    # Binding A, i, and the length to temporaries makes sure that every
+    # subexpression is evaluated exactly once.  The value of an array_store
+    # stays inside the in-bounds branch, matching the interpreter: an
+    # out-of-bounds store never evaluates the stored expression.
+    def bounds_checked(self, arr: expr, index: expr,
+                       access: typing.Callable[[Name, Name], expr]) -> expr:
+        t_arr = Name(generate_name('tmp'))
+        t_idx = Name(generate_name('tmp'))
+        t_len = Name(generate_name('tmp'))
+        check_lower = Compare(t_idx, [GtE()], [Constant(0)])
+        check_upper = Compare(t_idx, [Lt()], [t_len])
+        exit_call = Call(Name('exit'), [])
+        return Begin(
+            [Assign([t_arr], self.check_bounds_exp(arr)),
+             Assign([t_idx], self.check_bounds_exp(index)),
+             Assign([t_len], Call(Name('array_len'), [t_arr]))],
+            IfExp(check_lower,
+                  IfExp(check_upper, access(t_arr, t_idx), exit_call),
+                  exit_call))
+
+    def check_bounds_exp(self, e: expr) -> expr:
+        match e:
+            case Call(Name('array_load'), [arr, index]):
+                return self.bounds_checked(
+                    arr, index,
+                    lambda a, i: Call(Name('array_load'), [a, i]))
+            case Call(Name('array_store'), [arr, index, value]):
+                return self.bounds_checked(
+                    arr, index,
+                    lambda a, i: Call(Name('array_store'),
+                                      [a, i, self.check_bounds_exp(value)]))
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.check_bounds_exp(operand))
+            case BinOp(left, op, right):
+                return BinOp(self.check_bounds_exp(left), op,
+                             self.check_bounds_exp(right))
+            case Compare(left, ops, comparators):
+                return Compare(self.check_bounds_exp(left), ops,
+                               [self.check_bounds_exp(c) for c in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(self.check_bounds_exp(test),
+                             self.check_bounds_exp(body),
+                             self.check_bounds_exp(orelse))
+            case Tuple(es, Load()):
+                return Tuple([self.check_bounds_exp(x) for x in es], Load())
+            case List(es, Load()):
+                return List([self.check_bounds_exp(x) for x in es], Load())
+            case Call(func, args):
+                return Call(self.check_bounds_exp(func),
+                            [self.check_bounds_exp(a) for a in args])
+            case Begin(body, result):
+                return Begin(self.check_bounds_stmts(body),
+                             self.check_bounds_exp(result))
+            case Subscript(base, Constant(index), Load()):
+                return Subscript(self.check_bounds_exp(base), Constant(index),
+                                 Load())
+            case Constant(_) | Name(_) | GlobalValue(_) \
+                    | Allocate(_, _) | AllocateArray(_, _):
+                return e
+            case _:
+                raise Exception('error in check_bounds_exp, unexpected '
+                                + repr(e))
+
+    def check_bounds_stmt(self, s: stmt) -> stmt:
+        match s:
+            case Expr(exp):
+                return Expr(self.check_bounds_exp(exp))
+            case Assign([Name(id)], exp):
+                return Assign([Name(id)], self.check_bounds_exp(exp))
+            case Assign([Subscript(tup, Constant(n), Store())], value):
+                return Assign([Subscript(self.check_bounds_exp(tup),
+                                         Constant(n), Store())],
+                              self.check_bounds_exp(value))
+            case If(test, body, orelse):
+                return If(self.check_bounds_exp(test),
+                          self.check_bounds_stmts(body),
+                          self.check_bounds_stmts(orelse))
+            case While(test, body, []):
+                return While(self.check_bounds_exp(test),
+                             self.check_bounds_stmts(body), [])
+            case _:
+                raise Exception('error in check_bounds_stmt, unexpected '
+                                + repr(s))
+
+    def check_bounds_stmts(self, ss: list[stmt]) -> list[stmt]:
+        return [self.check_bounds_stmt(s) for s in ss]
+
+    def check_bounds(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                return Module(self.check_bounds_stmts(body))
+            case _:
+                raise Exception('error in check_bounds, unexpected ' + repr(p))
 
     ############################################################################
     # Expose Allocation
@@ -269,6 +487,34 @@ class Compiler:
                             [self.expose_alloc_exp(arg) for arg in args])
             case Begin(body, result):
                 return Begin(self.expose_alloc_stmts(body), self.expose_alloc_exp(result))
+            case List(es, Load()):
+                # Array creation (section 7.9.4): like a tuple, the
+                # initializers are evaluated first, then space is reserved,
+                # and finally the elements are stored.  The differences are
+                # that the allocation uses AllocateArray (an uninitialized
+                # array) and that its type is the ListType(...) recorded in
+                # has_type by the type checker.
+                if not hasattr(e, 'has_type'):
+                    raise ValueError('expose_alloc_exp: array is missing has_type; '
+                                     'run the type checker before expose_allocation')
+                init_names = []
+                stmts: list[stmt] = []
+                for init in es:
+                    name = generate_name('init')
+                    init_names.append(name)
+                    stmts.append(Assign([Name(name)], self.expose_alloc_exp(init)))
+                bytes = 8 * (len(es) + 1)
+                cond = Compare(BinOp(GlobalValue('free_ptr'), Add(), Constant(bytes)),
+                               [Lt()], [GlobalValue('fromspace_end')])
+                stmts.append(If(cond, [], [Collect(bytes)]))
+                alloc = generate_name('alloc')
+                stmts.append(Assign([Name(alloc)],
+                                    AllocateArray(len(es), e.has_type)))
+                for index, name in enumerate(init_names):
+                    stmts.append(Assign([Subscript(Name(alloc), Constant(index),
+                                                   Store())],
+                                        Name(name)))
+                return Begin(stmts, Name(alloc))
             case Tuple(es, Load()):
                 if not hasattr(e, 'has_type'):
                     raise ValueError('expose_alloc_exp: tuple is missing has_type; '
@@ -390,6 +636,27 @@ class Compiler:
                 (tup_name, tup_bindings) = self.rco_exp(exp, True)
                 r = Subscript(tup_name, Constant(n), Load())
                 return finish_rco(r, tup_bindings)
+            case AllocateArray(n, t) as alloc:
+                # An array allocation is a complex operand, but its length
+                # and type are constants, so there is nothing to reduce.
+                return finish_rco(alloc, [])
+            case Call(Name('array_len'), [exp]):
+                (arg, bindings) = self.rco_exp(exp, True)
+                return finish_rco(Call(Name('array_len'), [arg]), bindings)
+            case Call(Name('array_load'), [arr, index]):
+                (arr_name, arr_bindings) = self.rco_exp(arr, True)
+                (index_name, index_bindings) = self.rco_exp(index, True)
+                return finish_rco(Call(Name('array_load'), [arr_name, index_name]),
+                                  arr_bindings + index_bindings)
+            case Call(Name('array_store'), [arr, index, value]):
+                (arr_name, arr_bindings) = self.rco_exp(arr, True)
+                (index_name, index_bindings) = self.rco_exp(index, True)
+                (value_name, value_bindings) = self.rco_exp(value, True)
+                return finish_rco(
+                    Call(Name('array_store'), [arr_name, index_name, value_name]),
+                    arr_bindings + index_bindings + value_bindings)
+            case Call(Name('exit'), []) as call:
+                return finish_rco(call, [])
             case Begin(ss, result_exp):
                 # Remove complex operands from the begin's statements and
                 # from its result expression.  The result's temporaries must
@@ -497,8 +764,20 @@ class Compiler:
             case Allocate(_, _) as alloc:
                 # Allocation mutates the heap, so keep it in effect position.
                 return [Expr(alloc)] + force(cont)
-            case Subscript(_, _, Load()) | Call(Name('len'), [_]):
-                # Tuple access and len are pure; their operands are atoms.
+            case AllocateArray(_, _) as alloc:
+                # Array allocation mutates the heap as well.
+                return [Expr(alloc)] + force(cont)
+            case Call(Name('array_store'), [_, _, _]) as store:
+                # An array store writes to the heap.
+                return [Expr(store)] + force(cont)
+            case Call(Name('exit'), []) as call:
+                # exit never returns, so the continuation is unreachable;
+                # it is still kept so that the block has a valid tail.
+                return [Expr(call)] + force(cont)
+            case Subscript(_, _, Load()) | Call(Name('len'), [_]) \
+                    | Call(Name('array_len'), [_]) \
+                    | Call(Name('array_load'), [_, _]):
+                # Tuple/array access and len are pure; their operands are atoms.
                 return cont
             case Begin(stmts, result):
                 cont = self.explicate_effect(result, cont, basic_blocks)
@@ -655,12 +934,20 @@ class Compiler:
                 return []
             case Compare(_, [_], [_]):
                 return []
-            case GlobalValue(_) | Subscript(_, _, Load()) | Call(Name('len'), [_]):
+            case GlobalValue(_) | Subscript(_, _, Load()) | Call(Name('len'), [_]) \
+                    | Call(Name('array_len'), [_]) \
+                    | Call(Name('array_load'), [_, _]):
                 # These expressions are pure, so they have no effect when
                 # used as a statement.
                 return []
             case Allocate(_, _) as alloc:
                 return self.select_assign_into(Reg('rax'), alloc)
+            case AllocateArray(_, _) as alloc:
+                return self.select_assign_into(Reg('rax'), alloc)
+            case Call(Name('array_store'), [_, _, _]) as store:
+                return self.select_assign_into(Reg('rax'), store)
+            case Call(Name('exit'), []) as call:
+                return self.select_assign_into(Reg('rax'), call)
             case _:
                 raise Exception('error in select_exp_into, unexpected ' + repr(e))
 
@@ -701,6 +988,17 @@ class Compiler:
             if isinstance(t, TupleType):
                 mask = mask | (1 << i)
         return (mask << 7) | (len(types) << 1) | 1
+
+    def array_tag(self, ty: Type, length: int) -> int:
+        # The tag of an array (see section 7.9.1) has the following layout:
+        #   bit 0     : set to 1 when the array has not been copied yet
+        #   bit 1     : pointer mask, 1 when every element is a heap pointer
+        #   bits 2-61 : the length of the array (60 bits)
+        #   bit 62    : 0 for a tuple, 1 for an array
+        if not isinstance(ty, ListType):
+            raise ValueError('array_tag: expected a ListType, got ' + repr(ty))
+        pointer_mask = 1 if isinstance(ty.elt_type, (ListType, TupleType)) else 0
+        return 1 | (pointer_mask << 1) | (length << 2) | (1 << 62)
 
     def select_assign_into(self, lhs: Name | Reg, exp: expr) -> List[instr]:
         target = lhs if isinstance(lhs, Reg) else self.select_arg(lhs)
@@ -799,6 +1097,89 @@ class Compiler:
                 if target != Reg('r11'):
                     instrs.append(Instr('movq', [Reg('r11'), target]))
                 return instrs
+            case BinOp(left, Mult(), right):
+                # Multiplication is commutative, so whichever operand is
+                # already in the target can be multiplied in place.
+                left_arg = self.select_arg(left)
+                right_arg = self.select_arg(right)
+                if target == left_arg:
+                    return [Instr('imulq', [right_arg, target])]
+                if target == right_arg:
+                    return [Instr('imulq', [left_arg, target])]
+                return [
+                    Instr('movq', [left_arg, target]),
+                    Instr('imulq', [right_arg, target]),
+                ]
+            case Call(Name('array_len'), [arg]):
+                # The length of an array is stored in bits 2-61 of its tag.
+                # Shifting left and then right again clears bits 60-63
+                # (the tag bit and the top part of the length field) without
+                # needing a 64-bit mask, which would not fit in an immediate.
+                src = self.select_arg(arg)
+                instrs = []
+                if src != Reg('r11'):
+                    instrs.append(Instr('movq', [src, Reg('r11')]))
+                instrs.extend([
+                    Instr('movq', [Deref('r11', 0), target]),
+                    Instr('sarq', [Immediate(2), target]),
+                    Instr('shlq', [Immediate(4), target]),
+                    Instr('shrq', [Immediate(4), target]),
+                ])
+                return instrs
+            case Call(Name('array_load'), [arr, index]):
+                # The address of element i is arr + 8 (i + 1): the +1 skips
+                # the 8-byte tag.  The address is built in %rax and the
+                # loaded value travels through %r11.
+                arr_arg = self.select_arg(arr)
+                index_arg = self.select_arg(index)
+                instrs = []
+                if arr_arg != Reg('r11'):
+                    instrs.append(Instr('movq', [arr_arg, Reg('r11')]))
+                instrs.append(Instr('movq', [index_arg, Reg('rax')]))
+                instrs.extend([Instr('addq', [Reg('rax'), Reg('rax')])] * 3)
+                instrs.extend([
+                    Instr('addq', [Reg('r11'), Reg('rax')]),
+                    Instr('movq', [Deref('rax', 8), Reg('r11')]),
+                    Instr('movq', [Reg('r11'), target]),
+                ])
+                return instrs
+            case Call(Name('array_store'), [arr, index, value]):
+                # As with array_load, but the element is written.  The
+                # address lives in %r11 and the value in %rax so that the
+                # %rax scratch register used by patch_instructions for
+                # large immediates cannot clobber the address.
+                arr_arg = self.select_arg(arr)
+                index_arg = self.select_arg(index)
+                value_arg = self.select_arg(value)
+                instrs = [Instr('movq', [index_arg, Reg('r11')])]
+                instrs.extend([Instr('addq', [Reg('r11'), Reg('r11')])] * 3)
+                instrs.extend([
+                    Instr('addq', [arr_arg, Reg('r11')]),
+                    Instr('movq', [value_arg, Reg('rax')]),
+                    Instr('movq', [Reg('rax'), Deref('r11', 8)]),
+                ])
+                return instrs
+            case AllocateArray(n, ty):
+                # Inline array allocation: bump free_ptr and write the tag.
+                # The elements start out uninitialized (filled in by the
+                # element stores that expose_allocation generated).
+                tag = self.array_tag(ty, n)
+                instrs = [
+                    Instr('movq', [Global('free_ptr'), Reg('r11')]),
+                    Instr('addq', [Immediate(8 * (n + 1)), Global('free_ptr')]),
+                    Instr('movq', [Immediate(tag), Reg('rax')]),
+                    Instr('movq', [Reg('rax'), Deref('r11', 0)]),
+                ]
+                if target != Reg('r11'):
+                    instrs.append(Instr('movq', [Reg('r11'), target]))
+                return instrs
+            case Call(Name('exit'), []):
+                # An out-of-bounds access calls exit(255), which never
+                # returns, so no value is produced.
+                return [
+                    Instr('movq', [Immediate(255), Reg('rdi')]),
+                    Callq('exit', 0),
+                ]
             case _:
                 raise Exception(
                     'error in select_assign_into, unexpected ' + repr(exp)
@@ -937,7 +1318,9 @@ class Compiler:
         match i:
             case Instr('cmpq', [src, dst]):
                 return self.operand_locations(src) | self.operand_locations(dst)
-            case Instr(iname, [src, dst]) if iname in ['addq', 'subq', 'xorq']:
+            case Instr(iname, [src, dst]) if iname in \
+                    ['addq', 'subq', 'xorq', 'andq', 'sarq', 'shlq', 'shrq',
+                     'imulq']:
                 return self.operand_locations(src) | self.operand_locations(dst)
             case Instr(iname, [src, dst]) if iname in ['movq', 'movzbq']:
                 return self.operand_locations(src) | self.address_base_locations(dst)
@@ -957,7 +1340,9 @@ class Compiler:
 
     def W(self, i: instr) -> set[location]:
         match i:
-            case Instr(iname, [_, dst]) if iname in ['addq', 'subq', 'xorq']:
+            case Instr(iname, [_, dst]) if iname in \
+                    ['addq', 'subq', 'xorq', 'andq', 'sarq', 'shlq', 'shrq',
+                     'imulq']:
                 return self.written_locations(dst)
             case Instr('movq', [_, dst]):
                 return self.written_locations(dst)
@@ -1094,17 +1479,19 @@ class Compiler:
                         for v in lafter:
                             if d != v:
                                 add_edge(d, v)
-                    # GC rule (section 7.7): a tuple-typed variable that is
-                    # live across a call to collect must be spilled so the
-                    # collector can find it on the root stack.  Making it
-                    # conflict with every callee-saved register leaves it no
-                    # register to live in (the caller-saved ones already
-                    # conflict), so graph coloring is forced to spill it.
+                    # GC rule (sections 7.7 and 7.9): a heap-allocated
+                    # variable (a tuple or an array) that is live across a
+                    # call to collect must be spilled so the collector can
+                    # find it on the root stack.  Making it conflict with
+                    # every callee-saved register leaves it no register to
+                    # live in (the caller-saved ones already conflict), so
+                    # graph coloring is forced to spill it.
                     # r15 holds the root-stack pointer and is not an
                     # assignable color, so it is intentionally excluded.
                     for v in lafter:
                         if (isinstance(v, Variable)
-                                and isinstance(types.get(v.id), TupleType)):
+                                and isinstance(types.get(v.id),
+                                               (TupleType, ListType))):
                             for r in [Reg('rbx'), Reg('r12'),
                                       Reg('r13'), Reg('r14')]:
                                 add_edge(v, r)
@@ -1298,16 +1685,17 @@ class Compiler:
                 move_graph = self.move_related_graph(homes, body)
                 home = self.allocate_registers(interference, move_graph, p)
 
-                # Section 7.7: ordinary spills live below %rbp, but
-                # tuple-typed spills must live on the root stack -- the only
-                # stack the collector scans.  r15 points just past the
-                # reserved root-stack area (the prelude sets it up in 7.8),
-                # so the k-th slot is -8*k(%r15).
+                # Sections 7.7 and 7.9: ordinary spills live below %rbp, but
+                # heap-allocated (tuple- or array-typed) spills must live on
+                # the root stack -- the only stack the collector scans.  r15
+                # points just past the reserved root-stack area (the prelude
+                # sets it up in 7.8), so the k-th slot is -8*k(%r15).
                 #
                 # pseudocode:
                 #   root = 0
                 #   for v in sorted(home):                # deterministic order
-                #       if home[v] is an rbp spill and var_types[v] is a tuple:
+                #       if home[v] is an rbp spill and var_types[v] is a
+                #          tuple or an array:
                 #           root += 1; home[v] = Deref('r15', -8 * root)
                 #   p.root_stack_size = 8 * root
                 root_spills = 0
@@ -1317,7 +1705,7 @@ class Compiler:
                             and location.reg == 'rbp'
                             and location.offset < 0
                             and isinstance(p.var_types.get(variable.id),
-                                           TupleType)):
+                                           (TupleType, ListType))):
                         root_spills += 1
                         home[variable] = Deref('r15', -8 * root_spills)
                 p.root_stack_size = 8 * root_spills
@@ -1520,8 +1908,8 @@ class Compiler:
         #      -16(%r15), ... relative to that advanced pointer;
         #   3. zero every root slot.  collect may run before a variable is
         #      initialized, and the GC must not follow garbage as a pointer.
-        #      A single REP STOSQ does the zeroing, so the code size does not
-        #      grow with the number of slots.
+        #      Zeroing emits one movq/addq pair per reserved slot; a compact
+        #      REP STOSQ variant is kept commented out below.
         # Reserve max(ROOTSTACK_INIT_SIZE, root_stack_size + 8) bytes, rounded
         # up to 64 (the runtime requires multiples of 64).  The +8 guarantees
         # the collector's strict %r15 < rootstack_end assertion.
