@@ -1353,6 +1353,12 @@ class Compiler:
     # `Jump(B)`.  The trailing jump is redundant because control already falls
     # through from P into B's first instruction, so we delete the jump and
     # append B's instructions to P.
+    #
+    # A block can also be reached by a conditional branch, so merging is
+    # allowed only when B's sole incoming edge is that unconditional jump.
+    # The edge map therefore scans every instruction of a block, not just
+    # its last two: once a merge puts a conditional branch in the middle of
+    # a block, its target must still count as a predecessor.
     ############################################################################
 
     def remove_jumps(self, p: X86Program) -> X86Program:
@@ -1362,7 +1368,7 @@ class Compiler:
 
             edges = {}                       # block -> [(predecessor, kind)]
             for each block P in body:
-                for instr in the last two instructions of P:
+                for every instruction in P:  # including mid-block branches
                     if instr is Jump(t):      edges[t].append((P, 'jmp'))
                     if instr is JumpIf(_, t): edges[t].append((P, 'jcc'))
 
@@ -1388,7 +1394,13 @@ class Compiler:
                     edges: dict[str, list[tuple[str, str]]] = {
                         label: [] for label in body}
                     for p_label, instrs in body.items():
-                        for i in instrs[-2:]:
+                        # Scan every instruction, not just the last two: an
+                        # earlier merge may have left a conditional branch in
+                        # the middle of the block, and its target is still a
+                        # real predecessor.  Missing that edge would make the
+                        # target look mergeable, and a later merge would delete
+                        # it while the mid-block branch still refers to it.
+                        for i in instrs:
                             # Only edges to real blocks matter; `conclusion` is
                             # a dangling label at this stage of the pipeline.
                             if isinstance(i, Jump) and i.label in body:
