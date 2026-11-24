@@ -1479,21 +1479,83 @@ class Compiler:
     # Prelude & Conclusion
     ############################################################################
 
+    # Size of the root stack that main passes to initialize().  Unlike the
+    # heap (which the collector doubles whenever an allocation does not fit),
+    # the root stack never grows: the runtime asserts rootstack_begin <= %r15
+    # < rootstack_end every time collect runs.  So this must be strictly
+    # larger than the number of root slots the program uses.  65536 bytes =
+    # 8192 slots, matching the book, and is the budget shared by all functions
+    # once function calls start spilling to the root stack.
+    ROOTSTACK_INIT_SIZE = 65536
+    # Initial heap size passed to initialize().  The collector doubles the
+    # heap on demand, so this only controls how often the first collections
+    # happen; the book's Figure 7.17 deliberately starts with a tiny heap.
+    HEAP_SIZE = 16
+
     def prelude_and_conclusion(self, p: X86Program) -> X86Program:
         used_callee = p.used_callee
+        root_stack_size = p.root_stack_size
+        assert root_stack_size % 8 == 0, \
+            'root_stack_size must be a multiple of 8 bytes'
 
-        def prelude(stack_size) -> List[instr]:
+        # The GC only knows about pointers stored on the root stack, so before
+        # main starts we must:
+        #   1. call initialize(rootstack_size, heap_size) to set up the
+        #      globals free_ptr, fromspace_end and rootstack_begin;
+        #   2. load rootstack_begin into %r15, the root-stack pointer.  The
+        #      root stack grows upward: after zeroing, %r15 is advanced once
+        #      past main's slots, and main addresses them as -8(%r15),
+        #      -16(%r15), ... relative to that advanced pointer;
+        #   3. zero every root slot.  collect may run before a variable is
+        #      initialized, and the GC must not follow garbage as a pointer.
+        #      A single REP STOSQ does the zeroing, so the code size does not
+        #      grow with the number of slots.
+        # Reserve max(ROOTSTACK_INIT_SIZE, root_stack_size + 8) bytes, rounded
+        # up to 64 (the runtime requires multiples of 64).  The +8 guarantees
+        # the collector's strict %r15 < rootstack_end assertion.
+        def prelude(stack_size, root_stack_size) -> List[instr]:
             instrs = [
                 Instr('pushq', [Reg('rbp')]),
                 Instr('movq', [Reg('rsp'), Reg('rbp')]),
             ]
             instrs.extend(Instr('pushq', [reg]) for reg in used_callee)
             instrs.append(Instr('subq', [Immediate(stack_size), Reg('rsp')]))
+            rootstack_arg = align(
+                max(self.ROOTSTACK_INIT_SIZE, root_stack_size + 8), 64)
+            instrs.extend([
+                Instr('movq', [Immediate(rootstack_arg), Reg('rdi')]),
+                Instr('movq', [Immediate(self.HEAP_SIZE), Reg('rsi')]),
+                Callq('initialize', 2),
+                Instr('movq', [Global('rootstack_begin'), Reg('r15')]),
+            ])
+
+            if root_stack_size > 0:
+                for _ in range(root_stack_size // 8):
+                    instrs.extend([
+                    Instr('movq', [Immediate(0), Deref('r15', 0)]),
+                    Instr('addq', [Immediate(8), Reg('r15')]),
+                ])
+                '''
+                # Zero the reserved root slots with a single REP STOSQ instead
+                # of one movq/addq pair per slot.  %rax is the value, %rcx the
+                # quadword count and %rdi the destination; all three are dead
+                # before `start` runs, and DF is 0 per the ABI.
+                instrs.extend([
+                    Instr('movq', [Reg('r15'), Reg('rdi')]),
+                    Instr('movq', [Immediate(0), Reg('rax')]),
+                    Instr('movq', [Immediate(root_stack_size // 8), Reg('rcx')]),
+                    Instr('rep', ['stosq']),
+                    Instr('addq', [Immediate(root_stack_size), Reg('r15')]),
+                ])
+                '''
             instrs.append(Jump('start'))
             return instrs
 
-        def conclusion(stack_size) -> List[instr]:
-            instrs = [Instr('addq', [Immediate(stack_size), Reg('rsp')])]
+        # Unwind the root stack first: it points past main's spill slots, and
+        # the conclusion must remove the slots main reserved before returning.
+        def conclusion(stack_size, root_stack_size) -> List[instr]:
+            instrs = [Instr('subq', [Immediate(root_stack_size), Reg('r15')])]
+            instrs.append(Instr('addq', [Immediate(stack_size), Reg('rsp')]))
             instrs.extend(
                 Instr('popq', [reg]) for reg in reversed(used_callee))
             instrs.extend([
@@ -1507,12 +1569,13 @@ class Compiler:
                 if 'start' not in body:
                     raise ValueError(
                         "prelude_and_conclusion requires a 'start' block")
-                main_instrs = prelude(p.stack_size)
+                main_instrs = prelude(p.stack_size, root_stack_size)
                 new_body = {'main': main_instrs, 'start': body['start']}
                 body.pop('start')
                 for label, block in body.items():
                     new_body[label] = block
-                new_body['conclusion'] = conclusion(p.stack_size)
+                new_body['conclusion'] = conclusion(
+                    p.stack_size, root_stack_size)
                 p.body = new_body
                 return p
             case _:
