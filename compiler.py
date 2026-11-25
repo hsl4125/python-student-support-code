@@ -206,11 +206,7 @@ class Compiler:
             case Expr(Call(Name('print'),[exp])):
                 return Expr(Call(Name('print'), [self.shrink_exp(exp)]))
             case Expr(exp):
-                bodys = [
-                    Expr(self.shrink_exp(exp)),
-                    Return(Constant(0))
-                ]
-                return FunctionDef('main', [], bodys, None, IntType(), None)
+                return Expr(self.shrink_exp(exp))
             case Assign([Name(id)], exp):
                 return Assign([Name(id)], self.shrink_exp(exp))
             case Assign([Subscript(tup, index, Store())], value):
@@ -234,7 +230,17 @@ class Compiler:
     def shrink(self, p: Module) -> Module:
         match p:
             case Module(body):
-                return Module(self.shrink_stmts(body))
+                defs: list[stmt] = []
+                stmts: list[stmt] = []
+                for s in body:
+                    if isinstance(s, FunctionDef):
+                        defs.append(self.shrink_stmt(s))
+                    else:
+                        stmts.append(self.shrink_stmt(s))
+                main = FunctionDef('main', [], stmts + [Return(Constant(0))],
+                                   None, IntType(), None)
+                defs.append(main)
+                return Module(defs)
             case _:
                 raise Exception('error in shrink, unexpected ' + repr(p))
 
