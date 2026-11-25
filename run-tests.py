@@ -22,6 +22,7 @@ type_check_Carray = type_check_Carray.TypeCheckCarray().type_check
 typecheck_dict = {
     'source': type_check_Lfun,
     'shrink': type_check_Lfun,
+    'reveal_functions': type_check_Lfun,
     #'resolve': type_check_Larray,
     #'check_bounds': type_check_Larray,
     #'expose_allocation': type_check_Larray,
@@ -33,6 +34,7 @@ interp_Lfun = interp_Lfun.InterpLfun().interp
 interp_Carray = interp_Carray.InterpCarray().interp
 interp_dict = {
     'shrink': interp_Lfun,
+    'reveal_functions': interp_Lfun,
     #'resolve': interp_Larray,
     #'check_bounds': interp_Larray,
     #'expose_allocation': interp_Larray,

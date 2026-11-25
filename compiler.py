@@ -245,6 +245,130 @@ class Compiler:
                 raise Exception('error in shrink, unexpected ' + repr(p))
 
     ############################################################################
+    # Reveal Functions
+    ############################################################################
+    # A function name denotes an x86 label that must be turned into an address
+    # with `leaq`, whereas a local variable lives in a register or on the
+    # stack.  L_Fun conflates the two by representing both as Name, so this
+    # pass distinguishes references to known functions:
+    #
+    #     Name(f)  =>  FunRef(f, n)          n = arity of f
+    #
+    # `env` maps every function visible at this point to its arity.  A local
+    # binding shadows a function name, so parameters and assignment targets
+    # are removed from `env` for the rest of the scope.  Keeping shadows as
+    # Name prevents a later pass from compiling a local variable as a label.
+    #
+    # reveal_functions(Module(body)):
+    #     env = { }
+    #     for each FunctionDef(name, params, ...) in body:
+    #         env[name] = number of parameters
+    #     return Module([reveal_stmt(s, env) for s in body])
+    ############################################################################
+
+    def _param_names(self, params) -> list[str]:
+        # The source-language type checker normalizes parameters into a list
+        # of (name, type) pairs, but keep the raw ast.arguments form usable.
+        if isinstance(params, ast.arguments):
+            return [p.arg for p in params.args]
+        return [p[0] for p in params]
+
+    def reveal_exp(self, e: expr, env: dict[str, int]) -> expr:
+        match e:
+            case Name(id) if id in env:
+                return FunRef(id, env[id])
+            case Name(_) | Constant(_) | GlobalValue(_) | FunRef(_, _) | Allocate(_, _):
+                return e
+            case Call(func, args):
+                return Call(self.reveal_exp(func, env),
+                            [self.reveal_exp(a, env) for a in args])
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.reveal_exp(operand, env))
+            case BinOp(left, op, right):
+                return BinOp(self.reveal_exp(left, env), op,
+                             self.reveal_exp(right, env))
+            case Compare(left, ops, comparators):
+                return Compare(self.reveal_exp(left, env), ops,
+                               [self.reveal_exp(c, env) for c in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(self.reveal_exp(test, env),
+                             self.reveal_exp(body, env),
+                             self.reveal_exp(orelse, env))
+            case Tuple(es, Load()):
+                return Tuple([self.reveal_exp(x, env) for x in es], Load())
+            case List(es, Load()):
+                return List([self.reveal_exp(x, env) for x in es], Load())
+            case Subscript(base, index, Load()):
+                return Subscript(self.reveal_exp(base, env),
+                                 self.reveal_exp(index, env), Load())
+            case Begin(ss, result):
+                return Begin(self.reveal_stmts(ss, env),
+                             self.reveal_exp(result, env))
+            case _:
+                raise Exception('error in reveal_exp, unexpected ' + repr(e))
+
+    def reveal_stmts(self, ss: list[stmt], env: dict[str, int]) -> list[stmt]:
+        return [self.reveal_stmt(s, env) for s in ss]
+
+    def reveal_stmt(self, s: stmt, env: dict[str, int]) -> stmt:
+        match s:
+            case FunctionDef():
+                return self.reveal_def(s, env)
+            case Return(value):
+                return Return(self.reveal_exp(value, env))
+            case Expr(value):
+                return Expr(self.reveal_exp(value, env))
+            case Assign([Name(id)], rhs):
+                # Convert the right-hand side before shadowing the name so
+                # that `f = inc` still turns inc into a FunRef.
+                rhs2 = self.reveal_exp(rhs, env)
+                env.pop(id, None)
+                return Assign([Name(id)], rhs2)
+            case Assign([Subscript(base, Constant(n), Store())], value):
+                return Assign([Subscript(self.reveal_exp(base, env),
+                                         Constant(n), Store())],
+                              self.reveal_exp(value, env))
+            case Assign([Subscript(base, index, Store())], value):
+                return Assign([Subscript(self.reveal_exp(base, env),
+                                         self.reveal_exp(index, env), Store())],
+                              self.reveal_exp(value, env))
+            case If(test, thn, els):
+                return If(self.reveal_exp(test, env),
+                          self.reveal_stmts(thn, env),
+                          self.reveal_stmts(els, env))
+            case While(test, body, []):
+                return While(self.reveal_exp(test, env),
+                             self.reveal_stmts(body, env), [])
+            case _:
+                raise Exception('error in reveal_stmt, unexpected ' + repr(s))
+
+    def reveal_def(self, f: FunctionDef, env: dict[str, int]) -> FunctionDef:
+        match f:
+            case FunctionDef(name, params, body, dl, returns, comment):
+                # A parameter shadows a function of the same name.
+                new_env = dict(env)
+                for p in self._param_names(params):
+                    new_env.pop(p, None)
+                return FunctionDef(name, params,
+                                   self.reveal_stmts(body, new_env),
+                                   dl, returns, comment)
+            case _:
+                raise Exception('error in reveal_def, unexpected ' + repr(f))
+
+    # Name(f) -> FunRef(f, n)
+    def reveal_functions(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                env: dict[str, int] = {}
+                for s in body:
+                    match s:
+                        case FunctionDef(name, params, b, dl, returns, comment):
+                            env[name] = len(self._param_names(params))
+                return Module([self.reveal_stmt(s, env) for s in body])
+            case _:
+                raise Exception('error in reveal_functions, unexpected ' + repr(p))
+
+    ############################################################################
     # Overload Resolution
     ############################################################################
     # The L_Array language overloads several operators:
