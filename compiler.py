@@ -206,7 +206,11 @@ class Compiler:
             case Expr(Call(Name('print'),[exp])):
                 return Expr(Call(Name('print'), [self.shrink_exp(exp)]))
             case Expr(exp):
-                return Expr(self.shrink_exp(exp))
+                bodys = [
+                    Expr(self.shrink_exp(exp)),
+                    Return(Constant(0))
+                ]
+                return FunctionDef('main', [], bodys, None, IntType(), None)
             case Assign([Name(id)], exp):
                 return Assign([Name(id)], self.shrink_exp(exp))
             case Assign([Subscript(tup, index, Store())], value):
@@ -217,17 +221,20 @@ class Compiler:
                 return If(self.shrink_exp(exp), [self.shrink_stmt(s) for s in body], [self.shrink_stmt(s) for s in orelse])
             case While(test, body, []):
                 return While(self.shrink_exp(test), [self.shrink_stmt(s) for s in body], [])
+            case Return(exp):
+                return Return(self.shrink_exp(exp))
+            case FunctionDef(name, params, bodys, dl, ty, comment):
+                return FunctionDef(name, params, self.shrink_stmts(bodys), None, ty, None)
             case _:
                 raise Exception('error in shrink_stmt, unexpected ' + repr(s))
+
+    def shrink_stmts(self, ss: list[stmt]) -> list[stmt]:
+        return [self.shrink_stmt(s) for s in ss]
 
     def shrink(self, p: Module) -> Module:
         match p:
             case Module(body):
-                stmts = []
-                for stmt in body:
-                    s = self.shrink_stmt(stmt)
-                    stmts.append(s)
-                return Module(stmts)
+                return Module(self.shrink_stmts(body))
             case _:
                 raise Exception('error in shrink, unexpected ' + repr(p))
 
