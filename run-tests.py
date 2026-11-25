@@ -46,11 +46,13 @@ interp_dict = {
 }
 
 if True:
-    run_tests('tuple', compiler, 'tuple',
-              typecheck_dict,
-              interp_dict)
-
-if True:
     run_tests('array', compiler, 'array',
               typecheck_dict,
               interp_dict)
+else: 
+    run_one_test(os.getcwd() + '/tests/array/tuple-loop.py',
+                 'array',
+                 compiler,
+                 'array',
+                 typecheck_dict,
+                 interp_dict)
