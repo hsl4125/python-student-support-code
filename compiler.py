@@ -369,6 +369,148 @@ class Compiler:
                 raise Exception('error in reveal_functions, unexpected ' + repr(p))
 
     ############################################################################
+    #  Limit Functions
+    ############################################################################
+    #  The x86-64 calling convention passes at most six arguments in
+    #  registers (rdi, rsi, rdx, rcx, r8, r9), so this pass rewrites
+    #  functions and calls that involve more than six arguments: the first
+    #  five arguments are passed as usual and the remaining ones are packed
+    #  into a tuple that is passed as the sixth argument.  Keeping the
+    #  number of parameters at six or fewer lets us pass every argument in
+    #  registers and simplifies the implementation of tail calls.
+    #
+    #  pseudocode:
+    #    limit_function_def(f):
+    #        if len(f.params) <= 6:
+    #            return f with body rewritten (no substitutions)
+    #        tup = fresh name
+    #        env = { x_i : (tup, i - 6) | i > 6 }
+    #        params' = params[:5] + [(tup, TupleType([T_6, ..., T_n]))]
+    #        return f with params' and body rewritten under env
+    #
+    #    limit_exp(e, env):
+    #        Name(x) with x in env -> Subscript(Name(tup), Constant(k), Load())
+    #        Call(f, es) -> Call(limit(f), es'[:5] + [Tuple(es'[5:])])
+    #                       when there are more than six arguments
+    #        otherwise recurse over the subexpressions
+    #
+    def limit_exp(self, e: expr,
+                  env: dict[str, typing.Tuple[str, int]]) -> expr:
+        match e:
+            case Name(id) if id in env:
+                (tup, index) = env[id]
+                return Subscript(Name(tup), Constant(index), Load())
+            case Call(func, args):
+                new_func = self.limit_exp(func, env)
+                new_args = [self.limit_exp(arg, env) for arg in args]
+                # Pack arguments 6..n into a tuple so that the call site
+                # passes at most six arguments.
+                if len(new_args) > 6:
+                    new_args = new_args[:5] + [Tuple(new_args[5:], Load())]
+                return Call(new_func, new_args)
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.limit_exp(operand, env))
+            case BinOp(left, op, right):
+                return BinOp(self.limit_exp(left, env), op,
+                             self.limit_exp(right, env))
+            case Compare(left, ops, comparators):
+                return Compare(self.limit_exp(left, env), ops,
+                               [self.limit_exp(x, env) for x in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(self.limit_exp(test, env),
+                             self.limit_exp(body, env),
+                             self.limit_exp(orelse, env))
+            case Tuple(elts, Load()):
+                return Tuple([self.limit_exp(x, env) for x in elts], Load())
+            case List(elts, Load()):
+                return List([self.limit_exp(x, env) for x in elts], Load())
+            case Subscript(base, index, Load()):
+                return Subscript(self.limit_exp(base, env),
+                                 self.limit_exp(index, env), Load())
+            case Begin(stmts, result):
+                return Begin(self.limit_stmts(stmts, env),
+                             self.limit_exp(result, env))
+            case Name(_) | Constant(_) | GlobalValue(_) | FunRef(_, _) \
+               | Allocate(_, _) | AllocateArray(_, _):
+                return e
+            case _:
+                raise Exception('error in limit_exp, unexpected ' + repr(e))
+
+    def limit_stmts(self, ss: list[stmt],
+                    env: dict[str, typing.Tuple[str, int]]) -> list[stmt]:
+        return [self.limit_stmt(s, env) for s in ss]
+
+    def limit_stmt(self, s: stmt,
+                   env: dict[str, typing.Tuple[str, int]]) -> stmt:
+        match s:
+            case Expr(value):
+                return Expr(self.limit_exp(value, env))
+            case Return(value):
+                return Return(self.limit_exp(value, env))
+            case Assign([Name(id)], rhs) if id in env:
+                # The parameter lives in the packed tuple now, so an
+                # assignment must write through the tuple (Store context).
+                (tup, index) = env[id]
+                return Assign([Subscript(Name(tup), Constant(index), Store())],
+                              self.limit_exp(rhs, env))
+            case Assign([Name(id)], rhs):
+                return Assign([Name(id)], self.limit_exp(rhs, env))
+            case Assign([Subscript(base, index, Store())], value):
+                return Assign([Subscript(self.limit_exp(base, env),
+                                         self.limit_exp(index, env), Store())],
+                              self.limit_exp(value, env))
+            case If(test, thn, els):
+                return If(self.limit_exp(test, env),
+                          self.limit_stmts(thn, env),
+                          self.limit_stmts(els, env))
+            case While(test, body, []):
+                return While(self.limit_exp(test, env),
+                             self.limit_stmts(body, env), [])
+            case _:
+                raise Exception('error in limit_stmt, unexpected ' + repr(s))
+
+    def limit_function_def(self, f: FunctionDef) -> FunctionDef:
+        match f:
+            case FunctionDef(name, params, bodys, dl, ty, comment):
+                if isinstance(params, ast.arguments):
+                    raise Exception('limit_function_def: function parameters '
+                                    'must be normalized; run the type checker '
+                                    'before limit_functions')
+                if len(params) <= 6:
+                    return FunctionDef(name, params,
+                                       self.limit_stmts(bodys, {}),
+                                       dl, ty, comment)
+                # Pack parameters 6..n into a fresh tuple parameter and
+                # substitute tuple reads/writes for those parameters.
+                tup = generate_name('tup')
+                env: dict[str, typing.Tuple[str, int]] = {}
+                packed_types: list[Type] = []
+                for (index, (x, t)) in enumerate(params[5:]):
+                    env[x] = (tup, index)
+                    packed_types.append(t)
+                new_params = params[:5] + [(tup, TupleType(packed_types))]
+                return FunctionDef(name, new_params,
+                                   self.limit_stmts(bodys, env),
+                                   dl, ty, comment)
+            case _:
+                raise Exception('error in limit_function_def, unexpected '
+                                + repr(f))
+
+    def limit_functions(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                new_body: list[stmt] = []
+                for s in body:
+                    match s:
+                        case FunctionDef():
+                            new_body.append(self.limit_function_def(s))
+                        case _:
+                            new_body.append(self.limit_stmt(s, {}))
+                return Module(new_body)
+            case _:
+                raise Exception('error in limit_functions, unexpected ' + repr(p))
+
+    ############################################################################
     # Overload Resolution
     ############################################################################
     # The L_Array language overloads several operators:

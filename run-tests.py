@@ -23,6 +23,7 @@ typecheck_dict = {
     'source': type_check_Lfun,
     'shrink': type_check_Lfun,
     'reveal_functions': type_check_Lfun,
+    'limit_functions': type_check_Lfun,
     #'resolve': type_check_Larray,
     #'check_bounds': type_check_Larray,
     #'expose_allocation': type_check_Larray,
@@ -35,6 +36,7 @@ interp_Carray = interp_Carray.InterpCarray().interp
 interp_dict = {
     'shrink': interp_Lfun,
     'reveal_functions': interp_Lfun,
+    'limit_functions': interp_Lfun,
     #'resolve': interp_Larray,
     #'check_bounds': interp_Larray,
     #'expose_allocation': interp_Larray,
@@ -52,7 +54,7 @@ if True:
               typecheck_dict,
               interp_dict)
 else: 
-    run_one_test(os.getcwd() + '/tests/fun/fun-1.py',
+    run_one_test(os.getcwd() + '/tests/fun/fun-tup-args.py',
                  'fun',
                  compiler,
                  'fun',
