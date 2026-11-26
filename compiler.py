@@ -2439,18 +2439,38 @@ class Compiler:
             case Instr('movzbq', [src, dst]) if not isinstance(dst, Reg):
                 instrs.append(Instr('movzbq', [src, Reg('rax')]))
                 instrs.append(Instr('movq', [Reg('rax'), dst]))
+            # Section 8.10: the destination of leaq must be a register.  When
+            # the allocator put the FunRef in a stack slot, compute the
+            # address in %rax and store it in the slot.
+            case Instr('leaq', [src, dst]) if not isinstance(dst, Reg):
+                instrs.append(Instr('leaq', [src, Reg('rax')]))
+                instrs.append(Instr('movq', [Reg('rax'), dst]))
+            # Section 8.10: the argument of TailJump must be %rax, our reserved
+            # register.  Expanding the tail call (section 8.11) pops the frame
+            # and restores the callee-saved registers, which tramples every
+            # other register before the jump.
+            case TailJump(func, arity) if not (isinstance(func, Reg)
+                                               and func.id == 'rax'):
+                instrs.append(Instr('movq', [func, Reg('rax')]))
+                instrs.append(TailJump(Reg('rax'), arity))
             case _:
                 instrs.append(i)
         return instrs
 
-    def patch_instructions(self, p: X86Program) -> X86Program:
+    def patch_instructions(self, p: X86ProgramDefs) -> X86ProgramDefs:
+        # Both the input and the output are X86ProgramDefs: a program is a list
+        # of function definitions, and each definition's block dictionary is
+        # patched independently.
         match p:
-            case X86Program(body):
-                for name, block in body.items():
-                    instrs = []
-                    for i in block:
-                        instrs += self.patch_instr(i)
-                    body[name] = instrs
+            case X86ProgramDefs(defs):
+                for d in defs:
+                    if isinstance(d.body, dict):
+                        d.body = {
+                            label: [patched
+                                    for i in instrs
+                                    for patched in self.patch_instr(i)]
+                            for label, instrs in d.body.items()
+                        }
                 return p
             case _:
                 raise Exception('error in patch_instructions, unexpected ' + repr(p))
