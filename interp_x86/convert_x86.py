@@ -42,6 +42,10 @@ def convert_instr(instr):
             return Tree(instr, [convert_arg(arg) for arg in args])
         case Callq(func, args):
             return Tree('callq', [func])
+        case IndirectCallq(func, num_args):
+            return Tree('indirect_callq', [convert_arg(func)])
+        case TailJump(func, arity):
+            return Tree('tailjmp', [convert_arg(func)])
         case Jump(label):
             return Tree('jmp', [label])
         case JumpIf(cc, label):
@@ -50,6 +54,22 @@ def convert_instr(instr):
             raise Exception('error in convert_instr, unhandled ' + repr(instr))
 
 def convert_program(p):
+    if isinstance(p, X86ProgramDefs):
+        # Flatten the per-function block dictionaries into one program.
+        # For the interpreter we also synthesize two blocks that a real
+        # x86 program gets from the prelude and conclusion (section 8.11):
+        #   <fn>            : entry alias so that leaq fn(%rip) finds code
+        #   <fn>_conclusion : retq, so Return can jump to it
+        blocks = []
+        for d in p.defs:
+            for (l, ss) in d.body.items():
+                blocks.append(Tree('block',
+                                   [l] + [convert_instr(instr) for instr in ss]))
+            blocks.append(Tree('block',
+                               [d.name, Tree('jmp', [d.name + '_start'])]))
+            blocks.append(Tree('block',
+                               [d.name + '_conclusion', Tree('retq', [])]))
+        return Tree('prog', blocks)
     if isinstance(p.body, list):
         main_instrs = [convert_instr(instr) for instr in p.body]
         main_block = Tree('block', ['main'] + main_instrs)

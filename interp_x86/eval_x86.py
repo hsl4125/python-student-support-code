@@ -65,8 +65,11 @@ class X86Emulator:
 
         self.log('========== STARTING EXECUTION ==============================')
 
-        # start evaluating at "main" or at "start"
-        if 'main' in blocks.keys():
+        # start evaluating at "main_start", "main" or "start"
+        if 'main_start' in blocks.keys():
+            self.eval_instrs(blocks['main_start'], blocks,
+                             output)
+        elif 'main' in blocks.keys():
             self.eval_instrs(blocks['main'], blocks,
                              output)
         elif 'start' in blocks.keys():
@@ -441,7 +444,13 @@ class X86Emulator:
                 v = self.eval_arg(instr.children[0])
                 assert isinstance(v, FunPointer)
                 target = v.fun_name
+                # Each function call gets its own local variables: save the
+                # caller's pseudo-registers and restore them afterwards, as a
+                # real stack frame would keep them separate.
+                saved = self.variables
+                self.variables = defaultdict(lambda: None)
                 self.eval_instrs(blocks[target], blocks, output)
+                self.variables = saved
 
             elif instr.data == 'indirect_jmp':
                 v = self.eval_arg(instr.children[0])
@@ -449,6 +458,15 @@ class X86Emulator:
                 target = v.fun_name
                 self.eval_instrs(blocks[target], blocks, output)
                 return # after jumping, toss continuation
+
+            elif instr.data == 'tailjmp':
+                # A tail call: run the callee and then return from the
+                # current function, leaving the result in %rax.  The actual
+                # frame popping is the job of a later pass (section 8.10).
+                v = self.eval_arg(instr.children[0])
+                assert isinstance(v, FunPointer)
+                self.eval_instrs(blocks[v.fun_name], blocks, output)
+                return
 
             else:
                 raise RuntimeError(f'Unknown instruction: {instr.data}')

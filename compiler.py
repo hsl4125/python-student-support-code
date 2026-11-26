@@ -10,6 +10,9 @@ from dataflow_analysis import analyze_dataflow
 Binding = typing.Tuple[Name, expr]
 Temporaries = typing.List[Binding]
 
+# The integer argument-passing registers, in order (section 8.2.1).
+ARG_REGISTERS = ['rdi', 'rsi', 'rdx', 'rcx', 'r8', 'r9']
+
 
 @dataclass
 class Promise:
@@ -1397,6 +1400,9 @@ class Compiler:
                 return self.select_assign_into(Reg('rax'), store)
             case Call(Name('exit'), []) as call:
                 return self.select_assign_into(Reg('rax'), call)
+            case Call(_, _) as call:
+                # A call of a user-defined function may have side effects.
+                return self.select_assign_into(Reg('rax'), call)
             case _:
                 raise Exception('error in select_exp_into, unexpected ' + repr(e))
 
@@ -1629,17 +1635,53 @@ class Compiler:
                     Instr('movq', [Immediate(255), Reg('rdi')]),
                     Callq('exit', 0),
                 ]
+            case FunRef(label, _):
+                # A function reference is the address of its code label;
+                # leaq computes that address without touching memory
+                # (section 8.8).
+                return [Instr('leaq', [Global(label), target])]
+            case Call(func, args):
+                # A call of a user-defined function goes through the
+                # function's address, so it is an indirect call.
+                instrs = self.select_arguments(args)
+                instrs.append(IndirectCallq(self.select_arg(func), len(args)))
+                if target != Reg('rax'):
+                    instrs.append(Instr('movq', [Reg('rax'), target]))
+                return instrs
             case _:
                 raise Exception(
                     'error in select_assign_into, unexpected ' + repr(exp)
                 )
 
-    def select_tail(self, t: stmt) -> List[instr]:
+    def select_arguments(self, args: list[expr]) -> List[instr]:
+        # Move each argument into its argument-passing register
+        # (section 8.2.1).  limit_functions packs any arguments beyond the
+        # sixth into a tuple, so the six registers below are enough.
+        instrs: List[instr] = []
+        for (i, arg) in enumerate(args):
+            if i >= len(ARG_REGISTERS):
+                raise ValueError('select_arguments: too many arguments')
+            src = self.select_arg(arg)
+            dst = Reg(ARG_REGISTERS[i])
+            if src != dst:
+                instrs.append(Instr('movq', [src, dst]))
+        return instrs
+
+    def select_tail(self, t: stmt, conclusion: str) -> List[instr]:
         match t:
             case Return(value):
+                # The return value travels in %rax, then jump to the
+                # conclusion of the current function.
                 return self.select_assign_into(Reg('rax'), value) + [
-                    Jump('conclusion')
+                    Jump(conclusion)
                 ]
+            case TailCall(func, args):
+                # Pass the arguments, then pop the frame and jump.  The
+                # frame size is not known until register allocation, so we
+                # invent the tailjmp pseudo-instruction (section 8.8).
+                instrs = self.select_arguments(args)
+                instrs.append(TailJump(self.select_arg(func), len(args)))
+                return instrs
             case Goto(label):
                 return [Jump(label)]
             case If(Compare(left, [op], [right]), [Goto(thn)], [Goto(els)]):
@@ -1690,25 +1732,48 @@ class Compiler:
             case _:
                 raise Exception('error in select_stmt, unexpected ' + repr(s))
 
-    def select_instructions(self, p: CProgram) -> X86Program:
-        match p:
-            case CProgram(blocks):
-                x86_blocks = {}
-                for label, block in blocks.items():
+    def select_def(self, f: FunctionDef) -> FunctionDef:
+        # Lower one function definition from C_Fun to x86_Def_callq.
+        #
+        # Pseudocode:
+        #   for each block of f, in any order:
+        #       instrs = select_stmt for every statement except the tail
+        #       instrs += select_tail(tail, f + '_conclusion')
+        #       if this is the entry block:
+        #           prepend movq from argument registers to parameters
+        #   the parameters are removed from the definition
+        match f:
+            case FunctionDef(name, params, blocks, dl, ty, comment):
+                entry = name + '_start'
+                conclusion = name + '_conclusion'
+                x86_blocks: dict[str, list[instr]] = {}
+                for (label, block) in blocks.items():
                     if not block:
-                        raise ValueError(f'empty CIf block {label}')
-                    instructions = []
-                    for stmt in block[:-1]:
-                        instructions.extend(self.select_stmt(stmt))
-                    instructions.extend(self.select_tail(block[-1]))
-                    x86_blocks[label] = instructions
-                result = X86Program(x86_blocks)
-                # The register allocator needs variable types (section 7.7):
-                # a spilled tuple-typed variable must live on the root stack so
-                # that the garbage collector can see it.  The C_Tup type checker
-                # stored them on the CProgram before this pass ran.
-                result.var_types = dict(getattr(p, 'var_types', {}))
+                        raise ValueError(f'empty C_Fun block {label}')
+                    instrs: List[instr] = []
+                    if label == entry:
+                        # Turn the parameters into local variables by moving
+                        # them out of the argument-passing registers.
+                        for ((x, _), reg) in zip(params, ARG_REGISTERS):
+                            instrs.append(Instr('movq', [Reg(reg), Variable(x)]))
+                    for s in block[:-1]:
+                        instrs.extend(self.select_stmt(s))
+                    instrs.extend(self.select_tail(block[-1], conclusion))
+                    x86_blocks[label] = instrs
+                result = FunctionDef(name, [], x86_blocks, dl, ty, comment)
+                result.var_types = dict(getattr(f, 'var_types', {}))
                 return result
+            case _:
+                raise Exception('error in select_def, unexpected ' + repr(f))
+
+    def select_instructions(self, p: CProgramDefs) -> X86ProgramDefs:
+        # Lower each function definition of C_Fun to the language
+        # x86_Def_callq (section 8.8).  The parameters of a function become
+        # local variables and every function gets its own start and
+        # conclusion labels.
+        match p:
+            case CProgramDefs(defs):
+                return X86ProgramDefs([self.select_def(f) for f in defs])
             case _:
                 raise Exception('error in select_instructions, unexpected ' + repr(p))
 
