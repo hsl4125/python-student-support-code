@@ -1106,7 +1106,40 @@ class Compiler:
     ############################################################################
     # Explicate Control
     ############################################################################
-    
+    # The input is L_mon_FunRef: a module whose body is a list of function
+    # definitions (shrink has already turned the top-level statements into
+    # main), and whose expressions are in monadic normal form.
+    #
+    # The output is C_Fun:
+    #
+    #   tail  ::= Return(exp) | Goto(label)
+    #           | If(Compare(atm, [cmp], atm), [Goto(label)], [Goto(label)])
+    #           | TailCall(atm, atm*)
+    #   block ::= label: stmt* tail
+    #   def   ::= FunctionDef(label, params, {block, ...}, None, type, None)
+    #   C_Fun ::= CProgramDefs([def, ...])
+    #
+    # Every function definition gets its own dictionary of basic blocks.  The
+    # entry block is named <function>_start, which is the convention used by
+    # the C_Fun interpreter.
+    #
+    # The interesting part of the pass is the position of an expression:
+    #
+    #   tail position      a call becomes TailCall, so that the x86 backend
+    #                      can jump to the callee instead of calling it
+    #   predicate position a Call is evaluated and compared with True
+    #                      (a FunRef can never be a Boolean)
+    #   effect position    a Call is kept because it may have side effects
+    #   assignment         a Call can stay on the right-hand side
+    #
+    # Pseudocode for one function definition:
+    #
+    #   def explicate_def(name, params, body):
+    #       blocks = {}
+    #       blocks[name + '_start'] = force(explicate_stmts(body, [], blocks))
+    #       return FunctionDef(name, params, blocks, None, type, None)
+    #
+
     def explicate_stmts(
         self, stmts: list[stmt], cont: Code, basic_blocks: dict[str, list[stmt]]
     ) -> Code:
@@ -1118,7 +1151,8 @@ class Compiler:
         self, e: expr, cont: Code, basic_blocks: dict[str, list[stmt]]
     ) -> Code:
         match e:
-            case Constant(_) | Name(_) | GlobalValue(_):
+            case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _):
+                # Atoms have no side effects, so the effect context drops them.
                 return cont
             case Call(Name('input_int'), []) as call:
                 return [Expr(call)] + force(cont)
@@ -1156,6 +1190,9 @@ class Compiler:
             case Compare(left, [_], [right]):
                 cont = self.explicate_effect(right, cont, basic_blocks)
                 return self.explicate_effect(left, cont, basic_blocks)
+            case Call(_, _) as call:
+                # A call may have side effects, so it stays in effect position.
+                return [Expr(call)] + force(cont)
             case _:
                 raise Exception('error in explicate_effect, unexpected ' + repr(e))
 
@@ -1210,8 +1247,37 @@ class Compiler:
                 return [If(comparison,
                            force(create_block(thn, basic_blocks)),
                            force(create_block(els, basic_blocks)))]
+            case Call(_, _) as call:
+                # A call may return a Boolean, so evaluate it into a temporary
+                # and compare the result with True.  (A FunRef cannot be a
+                # Boolean, so there is deliberately no FunRef case.)
+                tmp = Name(generate_name('tmp'))
+                comparison = Compare(tmp, [Eq()], [Constant(True)])
+                return [Assign([tmp], call)] + \
+                       [If(comparison,
+                           force(create_block(thn, basic_blocks)),
+                           force(create_block(els, basic_blocks)))]
             case _:
                 raise Exception('error in explicate_pred, unexpected ' + repr(cnd))
+
+    def explicate_tail(
+        self, e: expr, basic_blocks: dict[str, list[stmt]]
+    ) -> Code:
+        # Expressions in tail position produce a block tail.  The default is
+        # Return; a call in tail position becomes TailCall so that the backend
+        # can jump to the callee instead of using callq + retq.
+        match e:
+            case Begin(stmts, result):
+                cont = self.explicate_tail(result, basic_blocks)
+                return self.explicate_stmts(stmts, cont, basic_blocks)
+            case IfExp(test, body, orelse):
+                thn = Promise(lambda: force(self.explicate_tail(body, basic_blocks)))
+                els = Promise(lambda: force(self.explicate_tail(orelse, basic_blocks)))
+                return self.explicate_pred(test, thn, els, basic_blocks)
+            case Call(func, args):
+                return [TailCall(func, args)]
+            case _:
+                return [Return(e)]
 
     def explicate_stmt(
         self, s: stmt, cont: Code, basic_blocks: dict[str, list[stmt]]
@@ -1245,20 +1311,42 @@ class Compiler:
                 basic_blocks[loop_head] = force(
                     self.explicate_pred(test, body_stmts, cont_block, basic_blocks))
                 return [Goto(loop_head)]
-            case Collect(n):
+            case Collect(n): 
                 return [Collect(n)] + force(cont)
+            case Return(value):
+                # A return is terminal, so the surrounding continuation is
+                # discarded and the value is explicated in tail position.
+                return self.explicate_tail(value, basic_blocks)
             case _:
                 raise Exception('error in explicate_stmt, unexpected ' + repr(s))
 
-    def explicate_control(self, p: Module) -> CProgram:
+    def explicate_def(self, f: FunctionDef) -> FunctionDef:
+        # Each function definition gets its own dictionary of basic blocks.
+        # The initial continuation is empty: a function body normally ends in
+        # Return, which discards the continuation.  Unreachable continuations
+        # are never forced, so they do not create empty blocks.
+        match f:
+            case FunctionDef(name, params, bodys, dl, ty, comment):
+                basic_blocks: dict[str, list[stmt]] = {}
+                entry = name + '_start'
+                basic_blocks[entry] = force(
+                    self.explicate_stmts(bodys, [], basic_blocks))
+                return FunctionDef(name, params, basic_blocks, dl, ty, comment)
+            case _:
+                raise Exception('error in explicate_def, unexpected ' + repr(f))
+
+    def explicate_control(self, p: Module) -> CProgramDefs:
         match p:
             case Module(body):
-                new_body = [Return(Constant(0))]
-                basic_blocks = {}
-                for s in reversed(body):
-                    new_body = self.explicate_stmt(s, new_body, basic_blocks)
-                basic_blocks[label_name('start')] = force(new_body)
-                return CProgram(basic_blocks)
+                defs: list[FunctionDef] = []
+                for s in body:
+                    match s:
+                        case FunctionDef() as f:
+                            defs.append(self.explicate_def(f))
+                        case _:
+                            raise Exception('error in explicate_control, '
+                                            'unexpected ' + repr(s))
+                return CProgramDefs(defs)
             case _:
                 raise Exception('error in explicate_control, unexpected ' + repr(p))
 
