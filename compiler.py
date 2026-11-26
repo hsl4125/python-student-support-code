@@ -2492,91 +2492,125 @@ class Compiler:
     # happen; the book's Figure 7.17 deliberately starts with a tiny heap.
     HEAP_SIZE = 16
 
-    def prelude_and_conclusion(self, p: X86Program) -> X86Program:
-        used_callee = p.used_callee
-        root_stack_size = p.root_stack_size
-        assert root_stack_size % 8 == 0, \
-            'root_stack_size must be a multiple of 8 bytes'
+    def prelude_and_conclusion(self, p: X86ProgramDefs) -> X86Program:
+        # Section 8.11.  Register allocation and patching are done, so:
+        #   1. every TailJump can be expanded into the epilogue of its own
+        #      function followed by `jmp *%rax`;
+        #   2. every function definition gets a prelude block (labelled with
+        #      the function name, which is what `leaq f(%rip)` refers to) and a
+        #      conclusion block (`<function>_conclusion`, the target of every
+        #      Return).
+        # The result is a single X86Program block dictionary: the function
+        # definitions are flattened into the program, and every per-function
+        # quantity (stack_size, used_callee, root_stack_size) is consumed here.
+        #
+        # Pseudocode for the prelude of a function f:
+        #
+        #     pushq %rbp; movq %rsp, %rbp        # new frame
+        #     pushq <used callee-saved regs>     # saved by f
+        #     subq $stack_size, %rsp             # room for spills (16-aligned)
+        #     if f is main:                      # set up the GC once
+        #         initialize(rootstack_size, heap_size)
+        #         movq rootstack_begin(%rip), %r15
+        #     zero the new root slots; %r15 advances by root_stack_size
+        #     jmp f_start
+        #
+        # Pseudocode for the conclusion of f:
+        #
+        #     addq $stack_size, %rsp             # discard the spill area
+        #     popq <used callee-saved regs>      # reverse order
+        #     subq $root_stack_size, %r15        # release f's root slots
+        #     popq %rbp
+        #     retq
+        #
+        # A tail call uses exactly the conclusion body, but ends with
+        # `jmp *%rax` instead of `retq`: the frame is gone before the jump, so
+        # the callee's own `retq` returns straight to the original caller.
 
-        # The GC only knows about pointers stored on the root stack, so before
-        # main starts we must:
-        #   1. call initialize(rootstack_size, heap_size) to set up the
-        #      globals free_ptr, fromspace_end and rootstack_begin;
-        #   2. load rootstack_begin into %r15, the root-stack pointer.  The
-        #      root stack grows upward: after zeroing, %r15 is advanced once
-        #      past main's slots, and main addresses them as -8(%r15),
-        #      -16(%r15), ... relative to that advanced pointer;
-        #   3. zero every root slot.  collect may run before a variable is
-        #      initialized, and the GC must not follow garbage as a pointer.
-        #      Zeroing emits one movq/addq pair per reserved slot; a compact
-        #      REP STOSQ variant is kept commented out below.
-        # Reserve max(ROOTSTACK_INIT_SIZE, root_stack_size + 8) bytes, rounded
-        # up to 64 (the runtime requires multiples of 64).  The +8 guarantees
-        # the collector's strict %r15 < rootstack_end assertion.
-        def prelude(stack_size, root_stack_size) -> List[instr]:
+        def zero_root_slots(instrs: List[instr], root_stack_size: int) -> None:
+            # The GC may collect before a root slot is initialized, so every
+            # new slot must be zeroed first (the GC skips null roots).  The
+            # root stack grows upward, hence the +8 advance per slot.
+            for _ in range(root_stack_size // 8):
+                instrs.extend([
+                    Instr('movq', [Immediate(0), Deref('r15', 0)]),
+                    Instr('addq', [Immediate(8), Reg('r15')]),
+                ])
+
+        def prelude(name: str, stack_size: int,
+                    used_callee: List[Reg], root_stack_size: int) -> List[instr]:
             instrs = [
                 Instr('pushq', [Reg('rbp')]),
                 Instr('movq', [Reg('rsp'), Reg('rbp')]),
             ]
             instrs.extend(Instr('pushq', [reg]) for reg in used_callee)
             instrs.append(Instr('subq', [Immediate(stack_size), Reg('rsp')]))
-            rootstack_arg = align(
-                max(self.ROOTSTACK_INIT_SIZE, root_stack_size + 8), 64)
-            instrs.extend([
-                Instr('movq', [Immediate(rootstack_arg), Reg('rdi')]),
-                Instr('movq', [Immediate(self.HEAP_SIZE), Reg('rsi')]),
-                Callq('initialize', 2),
-                Instr('movq', [Global('rootstack_begin'), Reg('r15')]),
-            ])
-
-            if root_stack_size > 0:
-                for _ in range(root_stack_size // 8):
-                    instrs.extend([
-                    Instr('movq', [Immediate(0), Deref('r15', 0)]),
-                    Instr('addq', [Immediate(8), Reg('r15')]),
-                ])
-                '''
-                # Zero the reserved root slots with a single REP STOSQ instead
-                # of one movq/addq pair per slot.  %rax is the value, %rcx the
-                # quadword count and %rdi the destination; all three are dead
-                # before `start` runs, and DF is 0 per the ABI.
+            if name == 'main':
+                # The GC is initialized exactly once, before main's own root
+                # frame is reserved (the root-stack pointer is needed first).
+                rootstack_arg = align(
+                    max(self.ROOTSTACK_INIT_SIZE, root_stack_size + 8), 64)
                 instrs.extend([
-                    Instr('movq', [Reg('r15'), Reg('rdi')]),
-                    Instr('movq', [Immediate(0), Reg('rax')]),
-                    Instr('movq', [Immediate(root_stack_size // 8), Reg('rcx')]),
-                    Instr('rep', ['stosq']),
-                    Instr('addq', [Immediate(root_stack_size), Reg('r15')]),
+                    Instr('movq', [Immediate(rootstack_arg), Reg('rdi')]),
+                    Instr('movq', [Immediate(self.HEAP_SIZE), Reg('rsi')]),
+                    Callq('initialize', 2),
+                    Instr('movq', [Global('rootstack_begin'), Reg('r15')]),
                 ])
-                '''
-            instrs.append(Jump('start'))
+            zero_root_slots(instrs, root_stack_size)
+            instrs.append(Jump(name + '_start'))
             return instrs
 
-        # Unwind the root stack first: it points past main's spill slots, and
-        # the conclusion must remove the slots main reserved before returning.
-        def conclusion(stack_size, root_stack_size) -> List[instr]:
-            instrs = [Instr('subq', [Immediate(root_stack_size), Reg('r15')])]
-            instrs.append(Instr('addq', [Immediate(stack_size), Reg('rsp')]))
+        def conclusion(stack_size: int, used_callee: List[Reg],
+                       root_stack_size: int, ret: bool = True) -> List[instr]:
+            instrs = [Instr('addq', [Immediate(stack_size), Reg('rsp')])]
             instrs.extend(
                 Instr('popq', [reg]) for reg in reversed(used_callee))
-            instrs.extend([
-                Instr('popq', [Reg('rbp')]),
-                Instr('retq', []),
-            ])
+            instrs.append(
+                Instr('subq', [Immediate(root_stack_size), Reg('r15')]))
+            instrs.append(Instr('popq', [Reg('rbp')]))
+            if ret:
+                instrs.append(Instr('retq', []))
             return instrs
 
+        def expand_tail_jumps(instrs: List[instr], d: FunctionDef) -> List[instr]:
+            result = []
+            for i in instrs:
+                if isinstance(i, TailJump):
+                    # Epilogue of the current function, then an indirect jump
+                    # to the callee (8.10 guaranteed the target is %rax).
+                    result.extend(conclusion(d.stack_size, d.used_callee,
+                                             d.root_stack_size, ret=False))
+                    result.append(IndirectJump(i.func))
+                else:
+                    result.append(i)
+            return result
+
         match p:
-            case X86Program(body) if isinstance(body, dict):
-                if 'start' not in body:
-                    raise ValueError(
-                        "prelude_and_conclusion requires a 'start' block")
-                main_instrs = prelude(p.stack_size, root_stack_size)
-                new_body = {'main': main_instrs, 'start': body['start']}
-                body.pop('start')
-                for label, block in body.items():
-                    new_body[label] = block
-                new_body['conclusion'] = conclusion(
-                    p.stack_size, root_stack_size)
-                p.body = new_body
-                return p
+            case X86ProgramDefs(defs):
+                # main first, so `.globl main` precedes every other block.
+                ordered = sorted(
+                    defs, key=lambda d: 0 if d.name == 'main' else 1)
+                body: dict[str, List[instr]] = {}
+                for d in ordered:
+                    if not isinstance(d.body, dict):
+                        raise ValueError(
+                            'prelude_and_conclusion: function '
+                            + d.name + ' has no blocks')
+                    assert d.root_stack_size % 8 == 0, \
+                        'root_stack_size must be a multiple of 8 bytes'
+                    entry = d.name + '_start'
+                    if entry not in d.body:
+                        raise ValueError(
+                            'prelude_and_conclusion requires a '
+                            + entry + ' block')
+                    body[d.name] = prelude(
+                        d.name, d.stack_size, d.used_callee,
+                        d.root_stack_size)
+                    body[d.name + '_conclusion'] = conclusion(
+                        d.stack_size, d.used_callee, d.root_stack_size)
+                    for label, instrs in d.body.items():
+                        body[label] = expand_tail_jumps(instrs, d)
+                return X86Program(body)
             case _:
-                raise Exception('error in prelude_and_conclusion, unexpected ' + repr(p))
+                raise Exception(
+                    'error in prelude_and_conclusion, unexpected ' + repr(p))

@@ -2,47 +2,61 @@ import unittest
 from ast import *
 
 from compiler import Compiler
-from x86_ast import Immediate, Instr, Jump, Reg, X86Program
+from utils import IntType
+from x86_ast import (
+    Immediate,
+    IndirectJump,
+    Instr,
+    Jump,
+    Reg,
+    TailJump,
+    X86Program,
+    X86ProgramDefs,
+)
 
 
 def instr_strings(instrs):
     return [str(i).strip() for i in instrs]
 
 
+def make_def(name, blocks, stack_size=0, used_callee=None,
+             root_stack_size=0):
+    # An x86 function definition: the block dictionary lives in the body
+    # field, and assign_homes_def attaches the per-function numbers.
+    d = FunctionDef(name, [], blocks, None, IntType(), None)
+    d.stack_size = stack_size
+    d.used_callee = used_callee or []
+    d.root_stack_size = root_stack_size
+    return d
+
+
 class PreludeConclusionTests(unittest.TestCase):
     def setUp(self):
         self.compiler = Compiler()
 
-    def test_main_jumps_to_start_and_conclusion_is_a_block(self):
-        program = X86Program(
+    def test_main_prelude_initializes_gc_and_conclusion_unwinds(self):
+        main = make_def(
+            'main',
             {
-                'block.3': [
-                    Instr('movq', [Immediate(42), Reg('rcx')]),
-                    Jump('conclusion'),
-                ],
-                'block.4': [
-                    Instr('movq', [Immediate(0), Reg('rcx')]),
-                    Jump('conclusion'),
-                ],
-                'start': [
+                'main_start': [
                     Instr('movq', [Immediate(0), Reg('rax')]),
-                    Jump('conclusion'),
+                    Jump('main_conclusion'),
                 ],
             },
             stack_size=8,
             used_callee=[Reg('rbx')],
         )
 
-        patched = self.compiler.prelude_and_conclusion(program)
+        program = self.compiler.prelude_and_conclusion(
+            X86ProgramDefs([main]))
 
+        self.assertIsInstance(program, X86Program)
         self.assertEqual(
-            list(patched.body),
-            ['main', 'start', 'block.3', 'block.4', 'conclusion'],
+            list(program.body),
+            ['main', 'main_conclusion', 'main_start'],
         )
-        # main sets up the root stack for the garbage collector, then jumps
-        # to the start block instead of running the program directly.
         self.assertEqual(
-            instr_strings(patched.body['main']),
+            instr_strings(program.body['main']),
             [
                 'pushq %rbp',
                 'movq %rsp, %rbp',
@@ -52,130 +66,147 @@ class PreludeConclusionTests(unittest.TestCase):
                 'movq $16, %rsi',
                 'callq initialize',
                 'movq rootstack_begin(%rip), %r15',
-                'jmp start',
+                'jmp main_start',
             ],
         )
         self.assertEqual(
-            instr_strings(patched.body['conclusion']),
+            instr_strings(program.body['main_conclusion']),
             [
-                'subq $0, %r15',
                 'addq $8, %rsp',
                 'popq %rbx',
+                'subq $0, %r15',
                 'popq %rbp',
                 'retq',
             ],
         )
-        start = patched.body['start']
         self.assertEqual(
-            [(i.instr, i.args) for i in start[:-1]],
-            [('movq', (Immediate(0), Reg('rax')))],
+            instr_strings(program.body['main_start']),
+            ['movq $0, %rax', 'jmp main_conclusion'],
         )
-        self.assertIsInstance(start[-1], Jump)
-        self.assertEqual(start[-1].label, 'conclusion')
 
-    def test_no_callee_saved_or_stack_still_has_blocks(self):
-        program = X86Program({'start': [Instr('retq', [])]})
+    def test_non_main_function_has_no_initialize(self):
+        # A callee adds its own root frame on top of the caller's and zeroes
+        # only the new slots; only main calls initialize.
+        f = make_def(
+            'f',
+            {
+                'f_start': [
+                    Instr('movq', [Immediate(1), Reg('rax')]),
+                    Jump('f_conclusion'),
+                ],
+            },
+            root_stack_size=16,
+        )
 
-        patched = self.compiler.prelude_and_conclusion(program)
+        program = self.compiler.prelude_and_conclusion(
+            X86ProgramDefs([f]))
 
         self.assertEqual(
-            instr_strings(patched.body['main']),
+            list(program.body),
+            ['f', 'f_conclusion', 'f_start'],
+        )
+        self.assertEqual(
+            instr_strings(program.body['f']),
             [
                 'pushq %rbp',
                 'movq %rsp, %rbp',
                 'subq $0, %rsp',
-                'movq $65536, %rdi',
-                'movq $16, %rsi',
-                'callq initialize',
-                'movq rootstack_begin(%rip), %r15',
-                'jmp start',
+                'movq $0, 0(%r15)',
+                'addq $8, %r15',
+                'movq $0, 0(%r15)',
+                'addq $8, %r15',
+                'jmp f_start',
             ],
         )
         self.assertEqual(
-            instr_strings(patched.body['conclusion']),
+            instr_strings(program.body['f_conclusion']),
             [
-                'subq $0, %r15',
                 'addq $0, %rsp',
+                'subq $16, %r15',
                 'popq %rbp',
                 'retq',
             ],
         )
 
-    def test_root_stack_slots_are_zeroed(self):
-        # Two root slots (16 bytes) must be zeroed before the program starts;
-        # %r15 is advanced past them, and the conclusion unwinds it.
-        program = X86Program(
-            {'start': [Instr('retq', [])]},
+    def test_tail_jump_is_expanded_into_epilogue_and_indirect_jump(self):
+        main = make_def(
+            'main',
+            {
+                'main_start': [
+                    Instr('movq', [Immediate(1), Reg('rax')]),
+                    TailJump(Reg('rax'), 0),
+                ],
+            },
             stack_size=8,
             used_callee=[Reg('rbx')],
-            root_stack_size=16,
         )
 
-        patched = self.compiler.prelude_and_conclusion(program)
+        program = self.compiler.prelude_and_conclusion(
+            X86ProgramDefs([main]))
 
         self.assertEqual(
-            instr_strings(patched.body['main']),
+            instr_strings(program.body['main_start']),
             [
-                'pushq %rbp',
-                'movq %rsp, %rbp',
-                'pushq %rbx',
-                'subq $8, %rsp',
-                'movq $65536, %rdi',
-                'movq $16, %rsi',
-                'callq initialize',
-                'movq rootstack_begin(%rip), %r15',
-                'movq $0, 0(%r15)',
-                'addq $8, %r15',
-                'movq $0, 0(%r15)',
-                'addq $8, %r15',
-                'jmp start',
-            ],
-        )
-        self.assertEqual(
-            instr_strings(patched.body['conclusion']),
-            [
-                'subq $16, %r15',
+                'movq $1, %rax',
                 'addq $8, %rsp',
                 'popq %rbx',
+                'subq $0, %r15',
                 'popq %rbp',
-                'retq',
+                'jmp *%rax',
             ],
         )
+        self.assertNotIn(
+            'tailjmp %rax',
+            instr_strings(program.body['main_start']),
+        )
 
-    def test_large_root_stack_still_uses_minimum_size(self):
-        # ROOTSTACK_INIT_SIZE (8192 slots) is a floor: a larger
-        # root_stack_size must be rounded up to a multiple of 64 and still
-        # leave a strict margin below rootstack_end.  Zeroing emits one
-        # movq/addq pair per reserved slot.
+    def test_large_root_stack_is_zeroed_slot_by_slot(self):
         root_stack_size = 32768
-        program = X86Program(
-            {'start': [Instr('retq', [])]},
+        main = make_def(
+            'main',
+            {'main_start': [Instr('retq', [])]},
             root_stack_size=root_stack_size,
         )
 
-        patched = self.compiler.prelude_and_conclusion(program)
+        program = self.compiler.prelude_and_conclusion(
+            X86ProgramDefs([main]))
 
-        main = instr_strings(patched.body['main'])
-        self.assertIn('movq $65536, %rdi', main)
-        self.assertNotIn('rep stosq', main)
-        self.assertNotIn('movq $4096, %rcx', main)
-        self.assertNotIn('addq $32768, %r15', main)
+        main_instrs = instr_strings(program.body['main'])
+        self.assertIn('movq $65536, %rdi', main_instrs)
+        self.assertNotIn('rep stosq', main_instrs)
         self.assertEqual(
-            main.count('movq $0, 0(%r15)'),
+            main_instrs.count('movq $0, 0(%r15)'),
             root_stack_size // 8,
         )
         self.assertEqual(
-            main.count('addq $8, %r15'),
+            main_instrs.count('addq $8, %r15'),
             root_stack_size // 8,
         )
         self.assertEqual(
-            instr_strings(patched.body['conclusion'])[0],
+            instr_strings(program.body['main_conclusion'])[-1],
+            'retq',
+        )
+        self.assertIn(
             'subq $32768, %r15',
+            instr_strings(program.body['main_conclusion']),
         )
+
+    def test_main_block_comes_first(self):
+        f = make_def('f', {'f_start': [Instr('retq', [])]})
+        main = make_def('main', {'main_start': [Instr('retq', [])]})
+
+        program = self.compiler.prelude_and_conclusion(
+            X86ProgramDefs([f, main]))
+
+        labels = list(program.body)
+        self.assertEqual(labels[0], 'main')
+        self.assertIn('f', labels)
+        self.assertIn('f_conclusion', labels)
 
     def test_missing_start_block_raises(self):
+        main = make_def('main', {'some_block': [Instr('retq', [])]})
         with self.assertRaises(ValueError):
-            self.compiler.prelude_and_conclusion(X86Program({'main': []}))
+            self.compiler.prelude_and_conclusion(X86ProgramDefs([main]))
 
 
 if __name__ == '__main__':
