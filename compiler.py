@@ -1781,7 +1781,8 @@ class Compiler:
     # Assign Homes
     ############################################################################
 
-    def build_control_flow_graph(self, blocks: dict[str, list[instr]]) -> DirectedAdjList:
+    def build_control_flow_graph(self, blocks: dict[str, list[instr]],
+                                 conclusion: str = 'conclusion') -> DirectedAdjList:
         cfg = DirectedAdjList()
         # init vertex
         for label, block in blocks.items():
@@ -1796,7 +1797,10 @@ class Compiler:
             for i in reversed(instrs[-2:]):
                 if isinstance(i, Jump) or isinstance(i, JumpIf):
                     b = blocks.get(i.label, None)
-                    if b == None and i.label != 'conclusion':
+                    # A function's conclusion label is not a block (the
+                    # prelude generates it in section 8.11), so it is a
+                    # legitimate dangling target.
+                    if b == None and i.label != conclusion:
                         raise Exception('error in build_control_flow_graph blocks is not exist: ' + i.label)
                     jump_blocks.append(i.label)
             return jump_blocks
@@ -1847,6 +1851,13 @@ class Compiler:
             case Callq(_, n):
                 passed = [Reg('rdi'), Reg('rsi'), Reg('rdx'), Reg('rcx'), Reg('r8'), Reg('r9')]
                 return set(passed[:n])
+            case IndirectCallq(func, n) | TailJump(func, n):
+                # A function call with no label: the arity tells which
+                # argument registers are read, and the target is read to
+                # perform the transfer (section 8.9.1).
+                passed = [Reg('rdi'), Reg('rsi'), Reg('rdx'), Reg('rcx'),
+                          Reg('r8'), Reg('r9')]
+                return self.operand_locations(func) | set(passed[:n])
             case Instr('retq', []):
                 return {Reg('rax'), Reg('rsp')}
             case _:
@@ -1860,6 +1871,10 @@ class Compiler:
                 return self.written_locations(dst)
             case Instr('movq', [_, dst]):
                 return self.written_locations(dst)
+            case Instr('leaq', [_, dst]):
+                # leaq writes its destination register (section 8.8); from a
+                # liveness point of view it reads no location.
+                return self.written_locations(dst)
             case Instr('movzbq', [_, dst]):
                 return self.written_locations(dst)
             case Instr(iname, [dst]) if iname.startswith('set'):
@@ -1870,7 +1885,10 @@ class Compiler:
                 return {Reg('rsp')}
             case Instr('popq', [dst]):
                 return {Reg('rsp')} | self.written_locations(dst)
-            case Callq(_, _):
+            case Callq(_, _) | IndirectCallq(_, _) | TailJump(_, _):
+                # A call may overwrite all caller-saved registers, so any
+                # variable live across the call must move to a callee-saved
+                # register or to the stack (section 8.9.1).
                 rs = [Reg('rax'), Reg('rcx'), Reg('rdx'), Reg('rsi'), Reg('rdi'), Reg('r8'), Reg('r9'), Reg('r10'), Reg('r11')]
                 return set(rs)
             case Instr('retq', []):
@@ -1906,7 +1924,8 @@ class Compiler:
     #       return live                       # live-before of the block
     #   analyze_dataflow(transpose(cfg), transfer, ∅, union)
     #   return live_after
-    def uncover_live(self, blocks: dict[str, list[instr]]) -> dict[instr, set[location]]:
+    def uncover_live(self, blocks: dict[str, list[instr]],
+                     conclusion: str = 'conclusion') -> dict[instr, set[location]]:
         if not isinstance(blocks, dict):
             raise TypeError('uncover_live expects a dictionary of basic blocks')
 
@@ -1914,7 +1933,7 @@ class Compiler:
             if not instructions:
                 raise ValueError(f'empty basic block: {label}')
 
-        cfg = self.build_control_flow_graph(blocks)
+        cfg = self.build_control_flow_graph(blocks, conclusion)
 
         # build_control_flow_graph only looks at the last two instructions,
         # so validate every jump to keep a mid-block Jump/JumpIf from being
@@ -1986,17 +2005,20 @@ class Compiler:
                         for v in lafter:
                             if v not in (src, d):
                                 add_edge(d, v)
-                case Callq('collect', _):
+                case Callq('collect', _) | IndirectCallq(_, _) | TailJump(_, _):
                     # The usual rule: the call writes the caller-saved
                     # registers, so they conflict with everything live after.
                     for d in w:
                         for v in lafter:
                             if d != v:
                                 add_edge(d, v)
-                    # GC rule (sections 7.7 and 7.9): a heap-allocated
-                    # variable (a tuple or an array) that is live across a
-                    # call to collect must be spilled so the collector can
-                    # find it on the root stack.  Making it conflict with
+                    # GC rule (sections 7.7, 7.9 and 8.9.2): a heap-
+                    # allocated variable (a tuple or an array) that is live
+                    # across a call must be spilled so the collector can find
+                    # it on the root stack.  Any user-defined function may
+                    # allocate memory and therefore call collect, so this
+                    # rule applies to indirect calls and tail calls too.
+                    # Making the variable conflict with
                     # every callee-saved register leaves it no register to
                     # live in (the caller-saved ones already conflict), so
                     # graph coloring is forced to spill it.
@@ -2053,9 +2075,9 @@ class Compiler:
     #   vertices and can use the color of that vertex are given priority.
     def allocate_registers(self, g: UndirectedAdjList,
                            move_graph: UndirectedAdjList,
-                           p: X86Program) -> dict[Variable, arg]:
+                           d: FunctionDef) -> dict[Variable, arg]:
         w = [v for v in g.vertices() if isinstance(v, Variable)]
-        p.used_callee = []
+        d.used_callee = []
         if not w:
             return {}
         homes : dict[Variable, arg] = {}
@@ -2158,11 +2180,11 @@ class Compiler:
         ]
         for r in homes.values():
             if r in callee_saved:
-                if r not in p.used_callee:
-                    p.used_callee.append(r)
+                if r not in d.used_callee:
+                    d.used_callee.append(r)
 
         # spill variable resize offset: add used_callee size
-        spill_offset = len(p.used_callee) * 8
+        spill_offset = len(d.used_callee) * 8
         for variable, home in homes.items():
             if isinstance(home, Deref) and home.reg == 'rbp' and home.offset < 0:
                 homes[variable] = Deref('rbp', home.offset - spill_offset)
@@ -2188,22 +2210,39 @@ class Compiler:
         assert stack_size + 8 * c >= frame
         return stack_size
 
-    def assign_homes(self, p: X86Program) -> X86Program:
-        match p:
-            case X86Program(body) if isinstance(body, dict):
-                homes = self.all_home_vars(body)
-                live_after = self.uncover_live(body)
+    # Register allocation is a per-function activity (section 8.9): the
+    # liveness sets, the interference graph and the resulting homes never
+    # cross a function boundary, and each function gets its own stack frame
+    # (spills, callee-saved registers and root-stack slots).
+    def assign_homes_def(self, d: FunctionDef) -> FunctionDef:
+        # Pseudocode:
+        #   homes = all_home_vars(blocks)
+        #   live_after = uncover_live(blocks)
+        #   g = build_interference(blocks, live_after, d.var_types)
+        #   mov = move_related_graph(homes, blocks)
+        #   home = allocate_registers(g, mov, d)    # also sets d.used_callee
+        #   move heap-allocated rbp spills to the root stack (-8(%r15) ...)
+        #   d.root_stack_size = 8 * number_of_root_spills
+        #   replace every Variable by its home
+        #   d.stack_size = compute_stack_size(homes, d.used_callee)
+        match d:
+            case FunctionDef(name, params, blocks, dl, ty, comment) \
+                    if isinstance(blocks, dict):
+                var_types = dict(getattr(d, 'var_types', {}))
+                homes = self.all_home_vars(blocks)
+                live_after = self.uncover_live(blocks, name + '_conclusion')
 
                 interference = self.build_interference(
-                    body, live_after, p.var_types)
-                move_graph = self.move_related_graph(homes, body)
-                home = self.allocate_registers(interference, move_graph, p)
+                    blocks, live_after, var_types)
+                move_graph = self.move_related_graph(homes, blocks)
+                home = self.allocate_registers(interference, move_graph, d)
 
-                # Sections 7.7 and 7.9: ordinary spills live below %rbp, but
-                # heap-allocated (tuple- or array-typed) spills must live on
-                # the root stack -- the only stack the collector scans.  r15
-                # points just past the reserved root-stack area (the prelude
-                # sets it up in 7.8), so the k-th slot is -8*k(%r15).
+                # Sections 7.7, 7.9 and 8.9.2: ordinary spills live below
+                # %rbp, but heap-allocated (tuple- or array-typed) spills
+                # must live on the root stack -- the only stack the
+                # collector scans.  r15 points just past the reserved
+                # root-stack area (the prelude sets it up in 7.8), so the
+                # k-th slot is -8*k(%r15).
                 #
                 # pseudocode:
                 #   root = 0
@@ -2211,18 +2250,18 @@ class Compiler:
                 #       if home[v] is an rbp spill and var_types[v] is a
                 #          tuple or an array:
                 #           root += 1; home[v] = Deref('r15', -8 * root)
-                #   p.root_stack_size = 8 * root
+                #   d.root_stack_size = 8 * root
                 root_spills = 0
                 for variable in sorted(home, key=lambda v: v.id):
                     location = home[variable]
                     if (isinstance(location, Deref)
                             and location.reg == 'rbp'
                             and location.offset < 0
-                            and isinstance(p.var_types.get(variable.id),
+                            and isinstance(var_types.get(variable.id),
                                            (TupleType, ListType))):
                         root_spills += 1
                         home[variable] = Deref('r15', -8 * root_spills)
-                p.root_stack_size = 8 * root_spills
+                d.root_stack_size = 8 * root_spills
 
                 def assign_arg(a: arg) -> arg:
                     if isinstance(a, Variable):
@@ -2233,18 +2272,31 @@ class Compiler:
 
                 def assign_instr(i: instr) -> instr:
                     match i:
-                        case Instr(name, args):
-                            return Instr(name, [assign_arg(a) for a in args])
+                        case Instr(iname, args):
+                            return Instr(iname, [assign_arg(a) for a in args])
+                        case IndirectCallq(func, n):
+                            return IndirectCallq(assign_arg(func), n)
+                        case TailJump(func, n):
+                            return TailJump(assign_arg(func), n)
                         case _:
                             return i
 
-                for label, block in body.items():
-                    body[label] = [assign_instr(i) for i in block]
+                for label, block in blocks.items():
+                    blocks[label] = [assign_instr(i) for i in block]
 
-                p.stack_size = self.compute_stack_size(
-                    list(home.values()), p.used_callee)
+                d.stack_size = self.compute_stack_size(
+                    list(home.values()), d.used_callee)
+                return d
+            case _:
+                raise Exception('error in assign_homes_def, unexpected '
+                                + repr(d))
 
-                return p
+    def assign_homes(self, p: X86ProgramDefs) -> X86ProgramDefs:
+        # Every function definition is allocated separately; there is no
+        # top-level code any more (section 8.9.3).
+        match p:
+            case X86ProgramDefs(defs):
+                return X86ProgramDefs([self.assign_homes_def(d) for d in defs])
             case _:
                 raise Exception('error in assign_homes, unexpected ' + repr(p))
 

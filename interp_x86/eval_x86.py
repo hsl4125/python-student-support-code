@@ -21,6 +21,9 @@ def interp_x86(program):
 class FunPointer:
     fun_name: str
 
+CALLEE_SAVED = ['rbx', 'r12', 'r13', 'r14', 'r15']
+
+
 class X86Emulator:
     def __init__(self, logging=True):
         self.registers = defaultdict(lambda: None)
@@ -449,8 +452,14 @@ class X86Emulator:
                 # real stack frame would keep them separate.
                 saved = self.variables
                 self.variables = defaultdict(lambda: None)
+                # A real callee saves and restores the callee-saved
+                # registers in its prelude/conclusion (section 8.11); before
+                # that pass exists we model the ABI here so that the caller's
+                # values survive the call.
+                saved_regs = {r: self.registers[r] for r in CALLEE_SAVED}
                 self.eval_instrs(blocks[target], blocks, output)
                 self.variables = saved
+                self.registers.update(saved_regs)
 
             elif instr.data == 'indirect_jmp':
                 v = self.eval_arg(instr.children[0])
@@ -465,7 +474,9 @@ class X86Emulator:
                 # frame popping is the job of a later pass (section 8.10).
                 v = self.eval_arg(instr.children[0])
                 assert isinstance(v, FunPointer)
+                saved_regs = {r: self.registers[r] for r in CALLEE_SAVED}
                 self.eval_instrs(blocks[v.fun_name], blocks, output)
+                self.registers.update(saved_regs)
                 return
 
             else:
