@@ -23,11 +23,11 @@ typecheck_dict = {
     'source': type_check_Lfun,
     'shrink': type_check_Lfun,
     'reveal_functions': type_check_Lfun,
+    'resolve': type_check_Lfun,
+    'check_bounds': type_check_Lfun,
     'limit_functions': type_check_Lfun,
     'expose_allocation': type_check_Lfun,
     'remove_complex_operands': type_check_Lfun,
-    #'resolve': type_check_Larray,
-    #'check_bounds': type_check_Larray,
     #'explicate_control': type_check_Carray,
 }
 
@@ -36,11 +36,11 @@ interp_Carray = interp_Carray.InterpCarray().interp
 interp_dict = {
     'shrink': interp_Lfun,
     'reveal_functions': interp_Lfun,
+    'resolve': interp_Lfun,
+    'check_bounds': interp_Lfun,
     'limit_functions': interp_Lfun,
     'expose_allocation': interp_Lfun,
     'remove_complex_operands': interp_Lfun,
-    #'resolve': interp_Larray,
-    #'check_bounds': interp_Larray,
     #'explicate_control': interp_Carray,
     #'select_instructions': interp_x86,
     #'assign_homes': interp_x86,

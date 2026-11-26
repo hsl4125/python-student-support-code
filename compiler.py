@@ -569,7 +569,7 @@ class Compiler:
                             [self.resolve_exp(a) for a in args])
             case Begin(body, result):
                 return Begin(self.resolve_stmts(body), self.resolve_exp(result))
-            case Constant(_) | Name(_) | GlobalValue(_) \
+            case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _) \
                     | Allocate(_, _) | AllocateArray(_, _):
                 return e
             case _:
@@ -597,6 +597,13 @@ class Compiler:
                           self.resolve_stmts(orelse))
             case While(test, body, []):
                 return While(self.resolve_exp(test), self.resolve_stmts(body), [])
+            case Return(value):
+                # Functions may return array accesses, e.g. return A[i].
+                return Return(self.resolve_exp(value))
+            case FunctionDef(name, params, bodys, dl, ty, comment):
+                # Resolve the overloaded operations inside every function body.
+                return FunctionDef(name, params, self.resolve_stmts(bodys),
+                                   dl, ty, comment)
             case _:
                 raise Exception('error in resolve_stmt, unexpected ' + repr(s))
 
@@ -688,7 +695,7 @@ class Compiler:
             case Subscript(base, Constant(index), Load()):
                 return Subscript(self.check_bounds_exp(base), Constant(index),
                                  Load())
-            case Constant(_) | Name(_) | GlobalValue(_) \
+            case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _) \
                     | Allocate(_, _) | AllocateArray(_, _):
                 return e
             case _:
@@ -712,6 +719,13 @@ class Compiler:
             case While(test, body, []):
                 return While(self.check_bounds_exp(test),
                              self.check_bounds_stmts(body), [])
+            case Return(value):
+                # Functions may return array accesses, e.g. return A[i].
+                return Return(self.check_bounds_exp(value))
+            case FunctionDef(name, params, bodys, dl, ty, comment):
+                # Insert bounds checks inside every function body.
+                return FunctionDef(name, params, self.check_bounds_stmts(bodys),
+                                   dl, ty, comment)
             case _:
                 raise Exception('error in check_bounds_stmt, unexpected '
                                 + repr(s))
