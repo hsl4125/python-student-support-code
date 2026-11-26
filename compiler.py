@@ -2302,7 +2302,8 @@ class Compiler:
 
     ############################################################################
     # Remove Jumps
-    #
+    ############################################################################
+
     # Merge a basic block B into its unique predecessor P when P ends with
     # `Jump(B)`.  The trailing jump is redundant because control already falls
     # through from P into B's first instruction, so we delete the jump and
@@ -2313,9 +2314,16 @@ class Compiler:
     # The edge map therefore scans every instruction of a block, not just
     # its last two: once a merge puts a conditional branch in the middle of
     # a block, its target must still count as a predecessor.
-    ############################################################################
+    #
+    # Both the input and the output are X86ProgramDefs (section 8.9): a
+    # program is a list of function definitions, and every definition is merged
+    # independently - a block dictionary belongs to one function, so a jump
+    # never crosses a function boundary.  The labels `<function>_conclusion`
+    # are still dangling at this stage (the prelude/conclusion pass creates
+    # those blocks in section 8.11), so a target that is not a block in the
+    # current dictionary is not an edge.
 
-    def remove_jumps(self, p: X86Program) -> X86Program:
+    def remove_jumps_blocks(self, body: dict[str, list[instr]]) -> None:
         """Merge a basic block into its unique predecessor.
 
         Pseudocode:
@@ -2338,63 +2346,69 @@ class Compiler:
                     delete body[B]
                     changed = True
                     break
-            return p
+            # the block dictionary is modified in place
         """
-        match p:
-            case X86Program(body) if isinstance(body, dict):
-                while True:
-                    # Collect the incoming edges of every block so that we can
-                    # identify the blocks that have a unique predecessor.
-                    edges: dict[str, list[tuple[str, str]]] = {
-                        label: [] for label in body}
-                    for p_label, instrs in body.items():
-                        # Scan every instruction, not just the last two: an
-                        # earlier merge may have left a conditional branch in
-                        # the middle of the block, and its target is still a
-                        # real predecessor.  Missing that edge would make the
-                        # target look mergeable, and a later merge would delete
-                        # it while the mid-block branch still refers to it.
-                        for i in instrs:
-                            # Only edges to real blocks matter; `conclusion` is
-                            # a dangling label at this stage of the pipeline.
-                            if isinstance(i, Jump) and i.label in body:
-                                edges[i.label].append((p_label, 'jmp'))
-                            elif isinstance(i, JumpIf) and i.label in body:
-                                edges[i.label].append((p_label, 'jcc'))
+        while True:
+            # Collect the incoming edges of every block so that we can
+            # identify the blocks that have a unique predecessor.
+            edges: dict[str, list[tuple[str, str]]] = {
+                label: [] for label in body}
+            for p_label, instrs in body.items():
+                # Scan every instruction, not just the last two: an
+                # earlier merge may have left a conditional branch in
+                # the middle of the block, and its target is still a
+                # real predecessor.  Missing that edge would make the
+                # target look mergeable, and a later merge would delete
+                # it while the mid-block branch still refers to it.
+                for i in instrs:
+                    # Only edges to real blocks matter; `conclusion` is
+                    # a dangling label at this stage of the pipeline.
+                    if isinstance(i, Jump) and i.label in body:
+                        edges[i.label].append((p_label, 'jmp'))
+                    elif isinstance(i, JumpIf) and i.label in body:
+                        edges[i.label].append((p_label, 'jcc'))
 
-                    changed = False
-                    for b_label in list(body.keys()):
-                        incoming = edges[b_label]
-                        # A block with zero or several predecessors is a join
-                        # point (or unreachable), so it cannot be merged.
-                        if len(incoming) != 1:
-                            continue
-                        p_label, kind = incoming[0]
-                        # Merging a conditional jump would move the jump target
-                        # and change which branch is taken, so skip it.
-                        if kind != 'jmp':
-                            continue
-                        # A self loop cannot be inlined into itself.
-                        if p_label == b_label:
-                            continue
-                        # The predecessor must end with `jmp B`; otherwise
-                        # control would not fall through into B.
-                        if not body[p_label]:
-                            continue
-                        last = body[p_label][-1]
-                        if not (isinstance(last, Jump)
-                                and last.label == b_label):
-                            continue
-                        body[p_label] = body[p_label][:-1] + body[b_label]
-                        del body[b_label]
-                        changed = True
-                        # The edge map is stale after a merge; rebuild it.
-                        break
-                    if not changed:
-                        break
+            changed = False
+            for b_label in list(body.keys()):
+                incoming = edges[b_label]
+                # A block with zero or several predecessors is a join
+                # point (or unreachable), so it cannot be merged.
+                if len(incoming) != 1:
+                    continue
+                p_label, kind = incoming[0]
+                # Merging a conditional jump would move the jump target
+                # and change which branch is taken, so skip it.
+                if kind != 'jmp':
+                    continue
+                # A self loop cannot be inlined into itself.
+                if p_label == b_label:
+                    continue
+                # The predecessor must end with `jmp B`; otherwise
+                # control would not fall through into B.
+                if not body[p_label]:
+                    continue
+                last = body[p_label][-1]
+                if not (isinstance(last, Jump)
+                        and last.label == b_label):
+                    continue
+                body[p_label] = body[p_label][:-1] + body[b_label]
+                del body[b_label]
+                changed = True
+                # The edge map is stale after a merge; rebuild it.
+                break
+            if not changed:
+                break
+
+    def remove_jumps(self, p: X86ProgramDefs) -> X86ProgramDefs:
+        match p:
+            case X86ProgramDefs(defs):
+                for d in defs:
+                    if isinstance(d.body, dict):
+                        self.remove_jumps_blocks(d.body)
                 return p
             case _:
-                raise Exception('error in remove_jumps, unexpected ' + repr(p))
+                raise Exception('error in remove_jumps, unexpected '
+                                + repr(p))
 
     ############################################################################
     # Patch Instructions
