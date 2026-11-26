@@ -819,7 +819,11 @@ class Compiler:
                 return Begin(stmts, Name(alloc))
             case Subscript(exp, Constant(index), Load()):
                 return Subscript(self.expose_alloc_exp(exp), Constant(index), Load())
-            case Constant(_) | Name(_) | GlobalValue(_) | Allocate(_, _):
+            case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _) \
+                    | Allocate(_, _):
+                # FunRef is an atom here: section 8.6 turns it into a
+                # temporary assignment, and select_instructions compiles that
+                # assignment into a leaq.
                 return e
             case _:
                 raise Exception('error in expose_alloc_exp, unexpected ' + repr(e))
@@ -844,6 +848,8 @@ class Compiler:
             case While(test, body, []):
                 return While(self.expose_alloc_exp(test),
                              self.expose_alloc_stmts(body), [])
+            case Return(value):
+                return Return(self.expose_alloc_exp(value))
             case Collect(size):
                 return Collect(size)
             case _:
@@ -852,13 +858,40 @@ class Compiler:
     def expose_allocation(self, p: Module) -> Module:
         match p:
             case Module(body):
-                return Module(self.expose_alloc_stmts(body))
+                # Function definitions keep their shape; only their bodies
+                # contain tuples that need to be lowered.
+                new_body: list[stmt] = []
+                for stmt in body:
+                    match stmt:
+                        case FunctionDef(name, params, bodys, dl, ty, comment):
+                            new_body.append(FunctionDef(
+                                name, params, self.expose_alloc_stmts(bodys),
+                                dl, ty, comment))
+                        case _:
+                            new_body.append(self.expose_alloc_stmt(stmt))
+                return Module(new_body)
             case _:
                 raise Exception('error in expose_allocation, unexpected ' + repr(p))
 
     ############################################################################
     # Remove Complex Operands
     ############################################################################
+    # Section 8.6: the new decisions for L_Fun are how to classify FunRef and
+    # Call.
+    #
+    #   FunRef(f, n)        ==>  tmp = FunRef(f, n)        when an atom is needed
+    #   Call(callee, args)  ==>  tmp = Call(callee, args)  when an atom is needed
+    #
+    # A call expands to a sequence of instructions, so it cannot be an
+    # immediate operand of an x86 instruction; the callee and the arguments of
+    # a call must be atoms.  A function reference must be turned into an
+    # address with leaq, which needs a register as its target, so it is also
+    # complex.  A Call that is the value of a Return or the right-hand side of
+    # an assignment stays as is, so that explicate_control can recognize tail
+    # calls.
+    #
+    # The output language L_mon_FunRef is Module([def..., stmt...]): every
+    # function definition is processed like the body of main.
 
     def rco_exp(self, e: expr, need_atomic: bool) -> Tuple[expr, Temporaries]:
         def finish_rco(exp: expr, bindings: Temporaries):
@@ -874,6 +907,11 @@ class Compiler:
                 return (var, [])
             case GlobalValue(var) as g:
                 return (g, [])
+            case FunRef(id, arity) as fref:
+                # A function reference is complex: select_instructions
+                # compiles it into a leaq, which needs a register as its
+                # target, so an atom position binds it to a temporary.
+                return finish_rco(fref, [])
             case Call(Name('input_int'), []) as call:
                 return finish_rco(call, [])
             case Call(Name('len'), [exp]):
@@ -936,6 +974,18 @@ class Compiler:
                     arr_bindings + index_bindings + value_bindings)
             case Call(Name('exit'), []) as call:
                 return finish_rco(call, [])
+            case Call(func, args):
+                # A call is a complex operand: it expands to a sequence of
+                # instructions, so an atom position binds it to a temporary.
+                # The callee and every argument must be atoms; a FunRef callee
+                # therefore becomes a temporary holding the function address.
+                (func_expr, bindings) = self.rco_exp(func, True)
+                reduced_args = []
+                for arg in args:
+                    (arg_expr, arg_bindings) = self.rco_exp(arg, True)
+                    reduced_args.append(arg_expr)
+                    bindings += arg_bindings
+                return finish_rco(Call(func_expr, reduced_args), bindings)
             case Begin(ss, result_exp):
                 # Remove complex operands from the begin's statements and
                 # from its result expression.  The result's temporaries must
@@ -1005,19 +1055,37 @@ class Compiler:
                 stmts += make_assigns(value_bindings)
                 stmts.append(Assign([Subscript(tup_expr, Constant(n), Store())], value_expr))
                 return stmts
+            case Return(value):
+                # The result of a tail call stays a Call, so that
+                # explicate_control can turn it into a TailCall.
+                (expr, temporaries) = self.rco_exp(value, False)
+                stmts = make_assigns(temporaries)
+                stmts.append(Return(expr))
+                return stmts
             case Collect(n):
                 return [Collect(n)]
             case _:
                 raise Exception('error in rco_stmt, unexpected ' + repr(s))
 
+    def rco_stmts(self, ss: list[stmt]) -> list[stmt]:
+        stmts: list[stmt] = []
+        for s in ss:
+            stmts += self.rco_stmt(s)
+        return stmts
+
     def remove_complex_operands(self, p: Module) -> Module:
         match p:
             case Module(body):
-                stmts = []
+                new_body: list[stmt] = []
                 for stmt in body:
-                    s = self.rco_stmt(stmt)
-                    stmts += s
-                return Module(stmts)
+                    match stmt:
+                        case FunctionDef(name, params, bodys, dl, ty, comment):
+                            new_body.append(FunctionDef(
+                                name, params, self.rco_stmts(bodys),
+                                dl, ty, comment))
+                        case _:
+                            new_body += self.rco_stmt(stmt)
+                return Module(new_body)
             case _:
                 raise Exception('error in remove_complex_operands, unexpected ' + repr(p))
 
