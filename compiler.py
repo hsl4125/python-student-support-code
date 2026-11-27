@@ -2399,6 +2399,9 @@ class Compiler:
                 return Variable(id)
             case GlobalValue(var):
                 return Global(var)
+            case UncheckedCast(exp, _):
+                # A cast only adjusts the static type; it produces no code.
+                return self.select_arg(exp)
             case _:
                 raise Exception('error in select_arg, unexpected ' + repr(e))
 
@@ -2427,6 +2430,16 @@ class Compiler:
             case Call(Name('array_store'), [_, _, _]) as store:
                 return self.select_assign_into(Reg('rax'), store)
             case Call(Name('exit'), []) as call:
+                return self.select_assign_into(Reg('rax'), call)
+            case Uninitialized(_):
+                # An uninitialized value has no effect as a statement.
+                return []
+            case UncheckedCast(exp, _):
+                return self.select_exp_into(exp)
+            case AllocateClosure(_, _, _) as alloc:
+                return self.select_assign_into(Reg('rax'), alloc)
+            case Call(Name('arity'), [_]) as call:
+                # arity is a pure primitive, like len.
                 return self.select_assign_into(Reg('rax'), call)
             case Call(_, _) as call:
                 # A call of a user-defined function may have side effects.
@@ -2460,7 +2473,12 @@ class Compiler:
         #   bit 0     : set to 1 when the tuple has not been copied yet
         #   bits 1-6  : the length of the tuple
         #   bits 7-56 : a pointer mask, one bit per element, set to 1 when
-        #               the element is (or may be) a tuple pointer
+        #               the element is (or may be) a heap pointer, that is,
+        #               a tuple or an array (section 7.9.1)
+        # The collector follows a pointer only when its mask bit is set, so
+        # an element holding an array must be marked as a pointer too.
+        # In a closure (section 9.8) the first element is a code pointer,
+        # which is not a heap pointer, so its mask bit stays 0.
         if not isinstance(ty, TupleType):
             raise ValueError('tuple_tag: expected a TupleType, got ' + repr(ty))
         types = ty.types
@@ -2468,7 +2486,7 @@ class Compiler:
             raise ValueError('tuple_tag: tuples may have at most 50 elements')
         mask = 0
         for (i, t) in enumerate(types):
-            if isinstance(t, TupleType):
+            if isinstance(t, (TupleType, ListType)):
                 mask = mask | (1 << i)
         return (mask << 7) | (len(types) << 1) | 1
 
@@ -2655,6 +2673,43 @@ class Compiler:
                 ]
                 if target != Reg('r11'):
                     instrs.append(Instr('movq', [Reg('r11'), target]))
+                return instrs
+            case Uninitialized(_):
+                # An uninitialized value (a boxed variable's initial slot)
+                # must be a bit pattern that the collector never follows.
+                # Zero is such a value, so store an immediate 0.
+                return [Instr('movq', [Immediate(0), target])]
+            case UncheckedCast(exp, _):
+                # A cast only adjusts the static type; it produces no code.
+                return self.select_assign_into(lhs, exp)
+            case AllocateClosure(n, ty, arity):
+                # Allocate a closure like a tuple, but also store the arity
+                # in bits 57-61 of the tag (section 9.8).
+                if not (0 <= arity <= 31):
+                    raise ValueError(
+                        f'AllocateClosure: arity out of range: {arity}'
+                    )
+                tag = self.tuple_tag(ty) | (arity << 57)
+                instrs = [
+                    Instr('movq', [Global('free_ptr'), Reg('r11')]),
+                    Instr('addq', [Immediate(8 * (n + 1)), Global('free_ptr')]),
+                    Instr('movq', [Immediate(tag), Deref('r11', 0)]),
+                ]
+                if target != Reg('r11'):
+                    instrs.append(Instr('movq', [Reg('r11'), target]))
+                return instrs
+            case Call(Name('arity'), [arg]):
+                # The arity of a closure is stored in bits 57-61 of its tag,
+                # which is the first word of the tuple (section 9.8).
+                src = self.select_arg(arg)
+                instrs = []
+                if src != Reg('r11'):
+                    instrs.append(Instr('movq', [src, Reg('r11')]))
+                instrs.extend([
+                    Instr('movq', [Deref('r11', 0), target]),
+                    Instr('sarq', [Immediate(57), target]),
+                    Instr('andq', [Immediate(31), target]),
+                ])
                 return instrs
             case Call(Name('exit'), []):
                 # An out-of-bounds access calls exit(255), which never

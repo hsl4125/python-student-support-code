@@ -228,6 +228,23 @@ class X86Emulator:
         else:
             raise RuntimeError(f'Unknown arg in store_arg: {a}')
 
+    def call_function(self, target, blocks, output):
+        """Run a user-defined function call inside its own pseudo-frame.
+
+        Before the prelude/conclusion pass (section 8.11) exists there is no
+        prologue/epilogue adjusting %r15, so model one here: the callee gets
+        its own local variables and its own root-stack region.  Root-stack
+        slots are addressed at negative offsets from %r15, hence moving the
+        callee's %r15 upward by a large constant keeps the two frames apart.
+        """
+        saved_vars = self.variables
+        self.variables = defaultdict(lambda: None)
+        saved_regs = {r: self.registers[r] for r in CALLEE_SAVED}
+        self.registers['r15'] = saved_regs['r15'] + 4096
+        self.eval_instrs(blocks[target], blocks, output)
+        self.variables = saved_vars
+        self.registers.update(saved_regs)
+
     def eval_instrs(self, instrs, blocks, output):
         for instr in instrs:
             self.log(f'Evaluating instruction: {instr.pretty()}')
@@ -418,7 +435,7 @@ class X86Emulator:
                         print(self.print_state())
 
                 else:
-                    self.eval_instrs(blocks[target], blocks, output)
+                    self.call_function(target, blocks, output)
 
             elif instr.data == 'retq':
                 return
@@ -446,20 +463,7 @@ class X86Emulator:
             elif instr.data == 'indirect_callq':
                 v = self.eval_arg(instr.children[0])
                 assert isinstance(v, FunPointer)
-                target = v.fun_name
-                # Each function call gets its own local variables: save the
-                # caller's pseudo-registers and restore them afterwards, as a
-                # real stack frame would keep them separate.
-                saved = self.variables
-                self.variables = defaultdict(lambda: None)
-                # A real callee saves and restores the callee-saved
-                # registers in its prelude/conclusion (section 8.11); before
-                # that pass exists we model the ABI here so that the caller's
-                # values survive the call.
-                saved_regs = {r: self.registers[r] for r in CALLEE_SAVED}
-                self.eval_instrs(blocks[target], blocks, output)
-                self.variables = saved
-                self.registers.update(saved_regs)
+                self.call_function(v.fun_name, blocks, output)
 
             elif instr.data == 'indirect_jmp':
                 v = self.eval_arg(instr.children[0])
@@ -474,9 +478,7 @@ class X86Emulator:
                 # frame popping is the job of a later pass (section 8.10).
                 v = self.eval_arg(instr.children[0])
                 assert isinstance(v, FunPointer)
-                saved_regs = {r: self.registers[r] for r in CALLEE_SAVED}
-                self.eval_instrs(blocks[v.fun_name], blocks, output)
-                self.registers.update(saved_regs)
+                self.call_function(v.fun_name, blocks, output)
                 return
 
             else:

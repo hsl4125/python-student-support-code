@@ -46,6 +46,10 @@ def convert_instr(instr):
             return Tree('indirect_callq', [convert_arg(func)])
         case TailJump(func, arity):
             return Tree('tailjmp', [convert_arg(func)])
+        case IndirectJump(target):
+            # A tail call that was expanded into the epilogue plus an indirect
+            # jump (section 8.11): the function address is in a register.
+            return Tree('indirect_jmp', [convert_arg(target)])
         case Jump(label):
             return Tree('jmp', [label])
         case JumpIf(cc, label):

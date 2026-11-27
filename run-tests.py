@@ -48,11 +48,11 @@ interp_dict = {
     'expose_allocation': interp_Llambda,
     'remove_complex_operands': interp_Llambda,
     'explicate_control': interp_Clambda,
-#   'select_instructions': interp_x86,
-#   'assign_homes': interp_x86,
-#   'remove_jumps': interp_x86,
-#   'patch_instructions': interp_x86,
-#   'prelude_and_conclusion': interp_x86,
+    'select_instructions': interp_x86,
+    'assign_homes': interp_x86,
+    'remove_jumps': interp_x86,
+    'patch_instructions': interp_x86,
+    'prelude_and_conclusion': interp_x86,
 }
 
 if True:
