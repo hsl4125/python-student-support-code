@@ -621,6 +621,13 @@ class Compiler:
             case Subscript(base, index, Load()):
                 return (self.free_variables_exp(base) |
                         self.free_variables_exp(index))
+            case Begin(body, result):
+                # A begin expression binds the temporaries it assigns, so
+                # they are not free in the enclosing scope.
+                bound = self.assigned_vars_stmts(body)
+                fvs = (self.free_variables_stmts(body) |
+                       self.free_variables_exp(result))
+                return fvs - bound
             case _:
                 raise Exception('error in free_variables_exp, unexpected '
                                 + repr(e))
@@ -723,6 +730,11 @@ class Compiler:
             case Subscript(base, index, Load()):
                 return (self.free_in_lambda_exp(base) |
                         self.free_in_lambda_exp(index))
+            case Begin(body, result):
+                bound = self.assigned_vars_stmts(body)
+                fvs = (self.free_in_lambda_stmts(body) |
+                       self.free_in_lambda_exp(result))
+                return fvs - bound
             case Name(_) | Constant(_) | Uninitialized(_) | FunRef(_, _) | GlobalValue(_):
                 return set()
             case _:
@@ -809,6 +821,9 @@ class Compiler:
                 return Tuple([self.box_exp(x, af) for x in es], Load())
             case List(es, Load()):
                 return List([self.box_exp(x, af) for x in es], Load())
+            case Begin(body, result):
+                return Begin(self.box_stmts(body, af),
+                             self.box_exp(result, af))
             case Subscript(base, index, Load()):
                 return Subscript(self.box_exp(base, af),
                                  self.box_exp(index, af), Load())
@@ -1045,12 +1060,20 @@ class Compiler:
                 return self.merge_var_types(self.free_var_types(base),
                                             self.free_var_types(index))
             case Begin(body, result):
+                # The temporaries assigned by a begin expression are bound
+                # inside it, so they are not free variables of the lambda.
+                bound: set[str] = set()
+                for s in body:
+                    bound = bound | self.assigned_vars_stmt(s)
                 types = dict()
                 for s in body:
                     types = self.merge_var_types(types,
                                                  self.free_var_types_stmt(s))
-                return self.merge_var_types(types,
-                                            self.free_var_types(result))
+                types = self.merge_var_types(types,
+                                             self.free_var_types(result))
+                for name in bound:
+                    types.pop(name, None)
+                return types
             case _:
                 raise Exception('error in free_var_types, unexpected '
                                 + repr(e))
@@ -1285,6 +1308,10 @@ class Compiler:
     def limit_exp(self, e: expr,
                   env: dict[str, typing.Tuple[str, int]]) -> expr:
         match e:
+            case Closure(arity, args):
+                # A flat closure stores its free variables as tuple elements;
+                # they may refer to packed parameters, so rewrite them.
+                return Closure(arity, [self.limit_exp(arg, env) for arg in args])
             case Name(id) if id in env:
                 (tup, index) = env[id]
                 return Subscript(Name(tup), Constant(index), Load())
@@ -1319,7 +1346,7 @@ class Compiler:
                 return Begin(self.limit_stmts(stmts, env),
                              self.limit_exp(result, env))
             case Name(_) | Constant(_) | GlobalValue(_) | FunRef(_, _) \
-               | Allocate(_, _) | AllocateArray(_, _):
+               | Allocate(_, _) | AllocateArray(_, _) | Uninitialized(_):
                 return e
             case _:
                 raise Exception('error in limit_exp, unexpected ' + repr(e))
@@ -1331,6 +1358,9 @@ class Compiler:
     def limit_stmt(self, s: stmt,
                    env: dict[str, typing.Tuple[str, int]]) -> stmt:
         match s:
+            case AnnAssign(target, annotation, rhs, simple):
+                return AnnAssign(target, annotation,
+                                 self.limit_exp(rhs, env), simple)
             case Expr(value):
                 return Expr(self.limit_exp(value, env))
             case Return(value):
@@ -1438,6 +1468,10 @@ class Compiler:
                 if isinstance(arg_ty, ListType):
                     return Call(Name('array_len'), [arg2])
                 return Call(Name('len'), [arg2])
+            case Lambda(params, body):
+                # A lambda body may contain overloaded operators (array
+                # accesses, len, ...), so resolve inside it as well.
+                return Lambda(params, self.resolve_exp(body))
             case UnaryOp(op, operand):
                 return UnaryOp(op, self.resolve_exp(operand))
             case BinOp(left, op, right):
@@ -1458,13 +1492,18 @@ class Compiler:
             case Begin(body, result):
                 return Begin(self.resolve_stmts(body), self.resolve_exp(result))
             case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _) \
-                    | Allocate(_, _) | AllocateArray(_, _):
+                    | Allocate(_, _) | AllocateArray(_, _) | Uninitialized(_):
                 return e
             case _:
                 raise Exception('error in resolve_exp, unexpected ' + repr(e))
 
     def resolve_stmt(self, s: stmt) -> stmt:
         match s:
+            case AnnAssign(target, annotation, rhs, simple):
+                # The target is a plain variable, but the right-hand side may
+                # contain an overloaded operator.
+                return AnnAssign(target, annotation, self.resolve_exp(rhs),
+                                 simple)
             case Assign([Subscript(base, index, Store())], value):
                 base_ty = getattr(base, 'has_type', None)
                 if isinstance(base_ty, ListType):
@@ -1549,6 +1588,9 @@ class Compiler:
 
     def check_bounds_exp(self, e: expr) -> expr:
         match e:
+            case Lambda(params, body):
+                # Array accesses inside a lambda body need bounds checks too.
+                return Lambda(params, self.check_bounds_exp(body))
             case Call(Name('array_load'), [arr, index]):
                 return self.bounds_checked(
                     arr, index,
@@ -1584,7 +1626,7 @@ class Compiler:
                 return Subscript(self.check_bounds_exp(base), Constant(index),
                                  Load())
             case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _) \
-                    | Allocate(_, _) | AllocateArray(_, _):
+                    | Allocate(_, _) | AllocateArray(_, _) | Uninitialized(_):
                 return e
             case _:
                 raise Exception('error in check_bounds_exp, unexpected '
@@ -1592,6 +1634,9 @@ class Compiler:
 
     def check_bounds_stmt(self, s: stmt) -> stmt:
         match s:
+            case AnnAssign(target, annotation, rhs, simple):
+                return AnnAssign(target, annotation,
+                                 self.check_bounds_exp(rhs), simple)
             case Expr(exp):
                 return Expr(self.check_bounds_exp(exp))
             case Assign([Name(id)], exp):
