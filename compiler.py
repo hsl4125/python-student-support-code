@@ -1922,6 +1922,10 @@ class Compiler:
                 return (var, [])
             case GlobalValue(var) as g:
                 return (g, [])
+            case Uninitialized(ty) as uninit:
+                # A placeholder for a boxed local: it has a type but no
+                # runtime value, so it is an atom.
+                return (uninit, [])
             case FunRef(id, arity) as fref:
                 # A function reference is complex: select_instructions
                 # compiles it into a leaq, which needs a register as its
@@ -1972,6 +1976,16 @@ class Compiler:
                 # An array allocation is a complex operand, but its length
                 # and type are constants, so there is nothing to reduce.
                 return finish_rco(alloc, [])
+            case AllocateClosure(n, t, arity) as alloc:
+                # A closure allocation (section 9.7) is complex like an
+                # ordinary tuple allocation, with constant length and type.
+                return finish_rco(alloc, [])
+            case UncheckedCast(exp, ty):
+                # An unchecked cast is erased by select_instructions, but it
+                # must survive this pass because it carries the static type of
+                # the closure.  Reduce its operand to an atom first.
+                (inner, bindings) = self.rco_exp(exp, True)
+                return (UncheckedCast(inner, ty), bindings)
             case Call(Name('array_len'), [exp]):
                 (arg, bindings) = self.rco_exp(exp, True)
                 return finish_rco(Call(Name('array_len'), [arg]), bindings)
@@ -2152,7 +2166,8 @@ class Compiler:
         self, e: expr, cont: Code, basic_blocks: dict[str, list[stmt]]
     ) -> Code:
         match e:
-            case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _):
+            case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _) \
+                    | Uninitialized(_):
                 # Atoms have no side effects, so the effect context drops them.
                 return cont
             case Call(Name('input_int'), []) as call:
@@ -2162,6 +2177,9 @@ class Compiler:
                 return [Expr(alloc)] + force(cont)
             case AllocateArray(_, _) as alloc:
                 # Array allocation mutates the heap as well.
+                return [Expr(alloc)] + force(cont)
+            case AllocateClosure(_, _, _) as alloc:
+                # Closure allocation mutates the heap (section 9.7).
                 return [Expr(alloc)] + force(cont)
             case Call(Name('array_store'), [_, _, _]) as store:
                 # An array store writes to the heap.
@@ -2191,6 +2209,10 @@ class Compiler:
             case Compare(left, [_], [right]):
                 cont = self.explicate_effect(right, cont, basic_blocks)
                 return self.explicate_effect(left, cont, basic_blocks)
+            case UncheckedCast(exp, _):
+                # An unchecked cast generates no code; only its operand can
+                # have effects (it may contain an allocation).
+                return self.explicate_effect(exp, cont, basic_blocks)
             case Call(_, _) as call:
                 # A call may have side effects, so it stays in effect position.
                 return [Expr(call)] + force(cont)
@@ -2248,6 +2270,9 @@ class Compiler:
                 return [If(comparison,
                            force(create_block(thn, basic_blocks)),
                            force(create_block(els, basic_blocks)))]
+            case UncheckedCast(exp, _):
+                # A cast is transparent for control flow.
+                return self.explicate_pred(exp, thn, els, basic_blocks)
             case Call(_, _) as call:
                 # A call may return a Boolean, so evaluate it into a temporary
                 # and compare the result with True.  (A FunRef cannot be a
@@ -2275,6 +2300,11 @@ class Compiler:
                 thn = Promise(lambda: force(self.explicate_tail(body, basic_blocks)))
                 els = Promise(lambda: force(self.explicate_tail(orelse, basic_blocks)))
                 return self.explicate_pred(test, thn, els, basic_blocks)
+            case Call(Name(f), _) if f in builtin_functions:
+                # Primitives such as arity, len, print, and input_int are not
+                # function values, so a call to one is an ordinary expression
+                # in tail position, not a tail call.
+                return [Return(e)]
             case Call(func, args):
                 return [TailCall(func, args)]
             case _:

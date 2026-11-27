@@ -6,6 +6,8 @@ sys.path.append('../python-student-support-code/interp_x86')
 import compiler
 import type_check_Llambda
 import interp_Llambda
+import type_check_Clambda
+import interp_Clambda
 from utils import run_tests, run_one_test, enable_tracing
 from interp_x86.eval_x86 import interp_x86
 from utils import run_tests, enable_tracing
@@ -16,6 +18,8 @@ compiler = compiler.Compiler()
 
 type_check_Llambda = type_check_Llambda.TypeCheckLlambda().type_check
 interp_Llambda = interp_Llambda.InterpLlambda().interp
+type_check_Clambda = type_check_Clambda.TypeCheckClambda().type_check
+interp_Clambda = interp_Clambda.InterpClambda().interp
 
 typecheck_dict = {
     'source': type_check_Llambda,
@@ -28,8 +32,8 @@ typecheck_dict = {
     'convert_to_closures': type_check_Llambda,
     'limit_functions': type_check_Llambda,
     'expose_allocation': type_check_Llambda,
-#   'remove_complex_operands': type_check_Llambda,
-#   'explicate_control': type_check_Llambda,
+    'remove_complex_operands': type_check_Llambda,
+    'explicate_control': type_check_Clambda,
 }
 
 interp_dict = {
@@ -42,8 +46,8 @@ interp_dict = {
     'convert_to_closures': interp_Llambda,
     'limit_functions': interp_Llambda,
     'expose_allocation': interp_Llambda,
-#   'remove_complex_operands': interp_Llambda,
-#   'explicate_control': interp_Llambda,
+    'remove_complex_operands': interp_Llambda,
+    'explicate_control': interp_Clambda,
 #   'select_instructions': interp_x86,
 #   'assign_homes': interp_x86,
 #   'remove_jumps': interp_x86,
