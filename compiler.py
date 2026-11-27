@@ -199,6 +199,8 @@ class Compiler:
                 return List([self.shrink_exp(exp) for exp in es], Load())
             case Subscript(exp, index, Load()):
                 return Subscript(self.shrink_exp(exp), self.shrink_exp(index), Load())
+            case Lambda(params, body):
+                return Lambda(params, self.shrink_exp(body))
             case Constant(_) | Name(_):
                 return e
             case _:
@@ -216,6 +218,9 @@ class Compiler:
                 return Assign([Subscript(self.shrink_exp(tup),
                                          self.shrink_exp(index), Store())],
                               self.shrink_exp(value))
+            case AnnAssign(target, annotation, value, simple):
+                return AnnAssign(self.shrink_exp(target), annotation,
+                                 self.shrink_exp(value), simple)
             case If(exp, body, orelse):
                 return If(self.shrink_exp(exp), [self.shrink_stmt(s) for s in body], [self.shrink_stmt(s) for s in orelse])
             case While(test, body, []):
@@ -246,6 +251,149 @@ class Compiler:
                 return Module(defs)
             case _:
                 raise Exception('error in shrink, unexpected ' + repr(p))
+
+    ############################################################################
+    # Uniquify
+    ############################################################################
+    # Adding lambda introduces nested scopes, so one variable name can refer
+    # to several different bindings:
+    #
+    #     def f(x: int, y: int) -> Callable[[int], int]:
+    #         g = (lambda x: x + y)     # this x shadows the parameter x of f
+    #         h = (lambda y: x + y)     # this y shadows the parameter y of f
+    #
+    # Every later pass resolves a variable use by looking up its name, which
+    # is only sound if each name denotes a single binding (free-variable
+    # analysis, assignment conversion, and closure conversion all rely on
+    # this).  This pass gives every binding a fresh, globally unique name and
+    # rewrites each use to the name of the binding that is in scope.
+    # Function names stay untouched: they are global and unique already, and
+    # later passes use them as x86 labels (`leaq f(%rip)`).
+    #
+    # uniquify(Module(body)):
+    #     env = { }                                  # old name => new name
+    #     return Module([process_stmt(s, env) for s in body])
+    #
+    # process_exp(Name(x), env)          => Name(env[x]) if x in env, else Name(x)
+    # process_exp(Lambda(ps, body), env) => Lambda(fresh(ps),
+    #                                          process_exp(body, env + fresh(ps)))
+    # process_stmt(AnnAssign(x, t, e), env)   => binds fresh(x), then
+    #                                          AnnAssign(fresh(x), t, process_exp(e, env))
+    # process_stmt(Assign([Name(x)], e), env) => process_exp(e, env), then
+    #                                          target = env[x] if x in env else fresh(x)
+    ############################################################################
+
+    def uniquify_param_names(self, params) -> list[str]:
+        # The source-language type checker normalizes parameters into a list
+        # of (name, type) pairs, but keep the raw ast.arguments form usable.
+        if isinstance(params, ast.arguments):
+            return [p.arg for p in params.args]
+        return [p[0] for p in params]
+
+    def uniquify_exp(self, e: expr, env: dict[str, str]) -> expr:
+        match e:
+            case Name(id):
+                return Name(env[id]) if id in env else e
+            case Lambda(params, body):
+                names = self.uniquify_param_names(params)
+                new_names = [generate_name(x) for x in names]
+                new_env = dict(env)
+                for (old, new) in zip(names, new_names):
+                    new_env[old] = new
+                return Lambda(new_names, self.uniquify_exp(body, new_env))
+            case BoolOp(op, values):
+                return BoolOp(op, [self.uniquify_exp(v, env) for v in values])
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.uniquify_exp(operand, env))
+            case BinOp(left, op, right):
+                return BinOp(self.uniquify_exp(left, env), op,
+                             self.uniquify_exp(right, env))
+            case Compare(left, ops, comparators):
+                return Compare(self.uniquify_exp(left, env), ops,
+                               [self.uniquify_exp(c, env)
+                                for c in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(self.uniquify_exp(test, env),
+                             self.uniquify_exp(body, env),
+                             self.uniquify_exp(orelse, env))
+            case Call(func, args):
+                return Call(self.uniquify_exp(func, env),
+                            [self.uniquify_exp(a, env) for a in args])
+            case Tuple(es, Load()):
+                return Tuple([self.uniquify_exp(x, env) for x in es], Load())
+            case List(es, Load()):
+                return List([self.uniquify_exp(x, env) for x in es], Load())
+            case Subscript(base, index, Load()):
+                return Subscript(self.uniquify_exp(base, env),
+                                 self.uniquify_exp(index, env), Load())
+            case Constant(_) | FunRef(_, _):
+                return e
+            case _:
+                raise Exception('error in uniquify_exp, unexpected ' + repr(e))
+
+    def uniquify_stmts(self, ss: list[stmt], env: dict[str, str]) -> list[stmt]:
+        return [self.uniquify_stmt(s, env) for s in ss]
+
+    def uniquify_stmt(self, s: stmt, env: dict[str, str]) -> stmt:
+        match s:
+            case FunctionDef(name, params, bodys, dl, ty, comment):
+                if isinstance(params, ast.arguments):
+                    raise Exception('uniquify: run the type checker before uniquify')
+                new_params = []
+                body_env: dict[str, str] = {}
+                for (x, t) in params:
+                    fresh = generate_name(x)
+                    new_params.append((fresh, t))
+                    body_env[x] = fresh
+                return FunctionDef(name, new_params,
+                                   self.uniquify_stmts(bodys, body_env),
+                                   dl, ty, comment)
+            case AnnAssign(target, annotation, value, simple):
+                # An annotated assignment always introduces a new binding.
+                match target:
+                    case Name(id):
+                        new_value = self.uniquify_exp(value, env)
+                        fresh = generate_name(id)
+                        env[id] = fresh
+                        return AnnAssign(Name(fresh), annotation,
+                                         new_value, simple)
+                    case _:
+                        raise Exception('error in uniquify_stmt, unexpected '
+                                        + repr(s))
+            case Assign([Name(id)], value):
+                new_value = self.uniquify_exp(value, env)
+                if id in env:
+                    return Assign([Name(env[id])], new_value)
+                fresh = generate_name(id)
+                env[id] = fresh
+                return Assign([Name(fresh)], new_value)
+            case Assign([Subscript(base, index, Store())], value):
+                return Assign([Subscript(self.uniquify_exp(base, env),
+                                         self.uniquify_exp(index, env),
+                                         Store())],
+                              self.uniquify_exp(value, env))
+            case Expr(value):
+                return Expr(self.uniquify_exp(value, env))
+            case Return(value):
+                return Return(self.uniquify_exp(value, env))
+            case If(test, body, orelse):
+                # Bindings introduced inside a branch do not escape it.
+                new_body = self.uniquify_stmts(body, dict(env))
+                new_orelse = self.uniquify_stmts(orelse, dict(env))
+                return If(self.uniquify_exp(test, env), new_body, new_orelse)
+            case While(test, body, []):
+                new_body = self.uniquify_stmts(body, dict(env))
+                return While(self.uniquify_exp(test, env), new_body, [])
+            case _:
+                raise Exception('error in uniquify_stmt, unexpected ' + repr(s))
+
+    def uniquify(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                env: dict[str, str] = {}
+                return Module([self.uniquify_stmt(s, env) for s in body])
+            case _:
+                raise Exception('error in uniquify, unexpected ' + repr(p))
 
     ############################################################################
     # Reveal Functions
