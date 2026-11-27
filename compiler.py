@@ -541,6 +541,372 @@ class Compiler:
                 raise Exception('error in reveal_functions, unexpected ' + repr(p))
 
     ############################################################################
+    #  Convert Assignments
+    ############################################################################
+    #  Section 9.4: Assignment Conversion.
+    #
+    #  Closure conversion captures the values of a lambda's free variables in
+    #  a flat closure tuple.  If such a variable is assigned later, the closure
+    #  keeps a stale copy, so the variable must live in a box on the heap and
+    #  the closure captures the box instead.
+    #
+    #  Only the variables that need it are boxed:
+    #
+    #      AF(f) = free_in_lambda(body(f)) ∩ assigned_vars(body(f))
+    #
+    #  The first set contains the variables that a lambda in f's body reads
+    #  from f's scope, the second one the variables that f assigns.  A boxed
+    #  variable x is read and written through a one-element tuple:
+    #
+    #      Name(x)            =>  Subscript(Name(x), Constant(0), Load())
+    #      x = rhs            =>  x[0] = rhs'
+    #      x : T = rhs        =>  x[0] = rhs'
+    #
+    #  The box itself is created at the beginning of the function body so that
+    #  it is available on every path:
+    #
+    #      x = (uninitialized(T),)         x is a boxed local
+    #      x = (x',)                       x is a boxed parameter, renamed x'
+    #
+    #  pseudocode:
+    #
+    #      convert_assignments(Module(body)):
+    #          return Module([convert_assignments_def(f) for f in body])
+    #
+    #      convert_assignments_def(FunctionDef(name, params, body, ...)):
+    #          AF = free_in_lambda(body) ∩ assigned_vars(body)
+    #          params' = [rename(p) if p in AF else p for p in params]
+    #          boxes   = [box_variable(x) for x in sorted(AF)]
+    #          body'   = [convert_stmt(s) for s in body]
+    #          return FunctionDef(name, params', boxes + body', None, T, None)
+    ############################################################################
+
+    def free_variables_exp(self, e: expr) -> set[str]:
+        """Free variables of e; lambda parameters are binders."""
+        match e:
+            case Name(id):
+                return {id}
+            case Constant(_) | Uninitialized(_) | FunRef(_, _) | GlobalValue(_):
+                return set()
+            case Lambda(params, body):
+                return self.free_variables_exp(body) - set(self._param_names(params))
+            case Call(func, args):
+                fvs = self.free_variables_exp(func)
+                for a in args:
+                    fvs = fvs | self.free_variables_exp(a)
+                return fvs
+            case BoolOp(_, values):
+                fvs: set[str] = set()
+                for v in values:
+                    fvs = fvs | self.free_variables_exp(v)
+                return fvs
+            case UnaryOp(_, operand):
+                return self.free_variables_exp(operand)
+            case BinOp(left, _, right):
+                return self.free_variables_exp(left) | self.free_variables_exp(right)
+            case Compare(left, _, comparators):
+                fvs = self.free_variables_exp(left)
+                for c in comparators:
+                    fvs = fvs | self.free_variables_exp(c)
+                return fvs
+            case IfExp(test, thn, els):
+                return (self.free_variables_exp(test) |
+                        self.free_variables_exp(thn) |
+                        self.free_variables_exp(els))
+            case Tuple(es, Load()) | List(es, Load()):
+                fvs = set()
+                for x in es:
+                    fvs = fvs | self.free_variables_exp(x)
+                return fvs
+            case Subscript(base, index, Load()):
+                return (self.free_variables_exp(base) |
+                        self.free_variables_exp(index))
+            case _:
+                raise Exception('error in free_variables_exp, unexpected '
+                                + repr(e))
+
+    def free_variables_stmt(self, s: stmt) -> set[str]:
+        match s:
+            case Expr(value):
+                return self.free_variables_exp(value)
+            case Assign([Name(id)], rhs):
+                return self.free_variables_exp(rhs)
+            case Assign([Subscript(base, index, Store())], value):
+                return (self.free_variables_exp(base) |
+                        self.free_variables_exp(index) |
+                        self.free_variables_exp(value))
+            case AnnAssign(Name(id), _, rhs, _):
+                return self.free_variables_exp(rhs)
+            case If(test, thn, els):
+                return (self.free_variables_exp(test) |
+                        self.free_variables_stmts(thn) |
+                        self.free_variables_stmts(els))
+            case While(test, body, []):
+                return (self.free_variables_exp(test) |
+                        self.free_variables_stmts(body))
+            case Return(value):
+                return self.free_variables_exp(value)
+            case Pass():
+                return set()
+            case _:
+                raise Exception('error in free_variables_stmt, unexpected '
+                                + repr(s))
+
+    def free_variables_stmts(self, ss: list[stmt]) -> set[str]:
+        fvs: set[str] = set()
+        assigned: set[str] = set()
+        for s in ss:
+            fvs = fvs | (self.free_variables_stmt(s) - assigned)
+            assigned = assigned | self.assigned_vars_stmt(s)
+        return fvs
+
+    def assigned_vars_stmt(self, s: stmt) -> set[str]:
+        """The variables assigned to by s (section 9.4)."""
+        match s:
+            case Assign([Name(id)], _):
+                return {id}
+            case AnnAssign(Name(id), _, _, _):
+                return {id}
+            case Assign([Subscript(_, _, Store())], _):
+                return set()
+            case If(_, thn, els):
+                return (self.assigned_vars_stmts(thn) |
+                        self.assigned_vars_stmts(els))
+            case While(_, body, []):
+                return self.assigned_vars_stmts(body)
+            case Expr(_) | Return(_) | Pass():
+                return set()
+            case _:
+                raise Exception('error in assigned_vars_stmt, unexpected '
+                                + repr(s))
+
+    def assigned_vars_stmts(self, ss: list[stmt]) -> set[str]:
+        assigned: set[str] = set()
+        for s in ss:
+            assigned = assigned | self.assigned_vars_stmt(s)
+        return assigned
+
+    def free_in_lambda_exp(self, e: expr) -> set[str]:
+        """Variables free in some lambda inside e (section 9.4)."""
+        match e:
+            case Lambda(params, body):
+                return (self.free_variables_exp(body)
+                        - set(self._param_names(params)))
+            case Call(func, args):
+                fvs = self.free_in_lambda_exp(func)
+                for a in args:
+                    fvs = fvs | self.free_in_lambda_exp(a)
+                return fvs
+            case BoolOp(_, values):
+                fvs: set[str] = set()
+                for v in values:
+                    fvs = fvs | self.free_in_lambda_exp(v)
+                return fvs
+            case UnaryOp(_, operand):
+                return self.free_in_lambda_exp(operand)
+            case BinOp(left, _, right):
+                return self.free_in_lambda_exp(left) | self.free_in_lambda_exp(right)
+            case Compare(left, _, comparators):
+                fvs = self.free_in_lambda_exp(left)
+                for c in comparators:
+                    fvs = fvs | self.free_in_lambda_exp(c)
+                return fvs
+            case IfExp(test, thn, els):
+                return (self.free_in_lambda_exp(test) |
+                        self.free_in_lambda_exp(thn) |
+                        self.free_in_lambda_exp(els))
+            case Tuple(es, Load()) | List(es, Load()):
+                fvs = set()
+                for x in es:
+                    fvs = fvs | self.free_in_lambda_exp(x)
+                return fvs
+            case Subscript(base, index, Load()):
+                return (self.free_in_lambda_exp(base) |
+                        self.free_in_lambda_exp(index))
+            case Name(_) | Constant(_) | Uninitialized(_) | FunRef(_, _) | GlobalValue(_):
+                return set()
+            case _:
+                raise Exception('error in free_in_lambda_exp, unexpected '
+                                + repr(e))
+
+    def free_in_lambda_stmt(self, s: stmt) -> set[str]:
+        match s:
+            case Expr(value):
+                return self.free_in_lambda_exp(value)
+            case Assign([Name(id)], rhs):
+                return self.free_in_lambda_exp(rhs)
+            case Assign([Subscript(base, index, Store())], value):
+                return (self.free_in_lambda_exp(base) |
+                        self.free_in_lambda_exp(index) |
+                        self.free_in_lambda_exp(value))
+            case AnnAssign(Name(id), _, rhs, _):
+                return self.free_in_lambda_exp(rhs)
+            case If(test, thn, els):
+                return (self.free_in_lambda_exp(test) |
+                        self.free_in_lambda_stmts(thn) |
+                        self.free_in_lambda_stmts(els))
+            case While(test, body, []):
+                return (self.free_in_lambda_exp(test) |
+                        self.free_in_lambda_stmts(body))
+            case Return(value):
+                return self.free_in_lambda_exp(value)
+            case Pass():
+                return set()
+            case _:
+                raise Exception('error in free_in_lambda_stmt, unexpected '
+                                + repr(s))
+
+    def free_in_lambda_stmts(self, ss: list[stmt]) -> set[str]:
+        fvs: set[str] = set()
+        for s in ss:
+            fvs = fvs | self.free_in_lambda_stmt(s)
+        return fvs
+
+    def binding_types(self, f: FunctionDef) -> dict[str, Type]:
+        """Types of the parameters and assigned variables of f."""
+        if isinstance(f.args, ast.arguments):
+            raise Exception('convert_assignments: run the type checker '
+                            'before convert_assignments')
+        types: dict[str, Type] = {name: ty for (name, ty) in f.args}
+
+        def scan(ss: list[stmt]) -> None:
+            for s in ss:
+                match s:
+                    case Assign([Name(id) as target], _) | AnnAssign(Name(id) as target, _, _, _):
+                        if hasattr(target, 'has_type'):
+                            types[id] = target.has_type
+                    case If(_, thn, els):
+                        scan(thn)
+                        scan(els)
+                    case While(_, body, []):
+                        scan(body)
+
+        scan(f.body)
+        return types
+
+    def box_exp(self, e: expr, af: set[str]) -> expr:
+        match e:
+            case Name(id) if id in af:
+                return Subscript(Name(id), Constant(0), Load())
+            case Lambda(params, body):
+                return Lambda(params, self.box_exp(body, af))
+            case Call(func, args):
+                return Call(self.box_exp(func, af),
+                            [self.box_exp(a, af) for a in args])
+            case BoolOp(op, values):
+                return BoolOp(op, [self.box_exp(v, af) for v in values])
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.box_exp(operand, af))
+            case BinOp(left, op, right):
+                return BinOp(self.box_exp(left, af), op, self.box_exp(right, af))
+            case Compare(left, ops, comparators):
+                return Compare(self.box_exp(left, af), ops,
+                               [self.box_exp(c, af) for c in comparators])
+            case IfExp(test, thn, els):
+                return IfExp(self.box_exp(test, af), self.box_exp(thn, af),
+                             self.box_exp(els, af))
+            case Tuple(es, Load()):
+                return Tuple([self.box_exp(x, af) for x in es], Load())
+            case List(es, Load()):
+                return List([self.box_exp(x, af) for x in es], Load())
+            case Subscript(base, index, Load()):
+                return Subscript(self.box_exp(base, af),
+                                 self.box_exp(index, af), Load())
+            case Name(_) | Constant(_) | Uninitialized(_) | FunRef(_, _) | GlobalValue(_):
+                return e
+            case _:
+                raise Exception('error in box_exp, unexpected ' + repr(e))
+
+    def box_stmt(self, s: stmt, af: set[str]) -> stmt:
+        match s:
+            case Assign([Name(id)], rhs) if id in af:
+                return Assign([Subscript(Name(id), Constant(0), Store())],
+                              self.box_exp(rhs, af))
+            case Assign([Name(id)], rhs):
+                return Assign([Name(id)], self.box_exp(rhs, af))
+            case Assign([Subscript(base, index, Store())], value):
+                return Assign([Subscript(self.box_exp(base, af),
+                                         self.box_exp(index, af), Store())],
+                              self.box_exp(value, af))
+            case AnnAssign(Name(id), _, rhs, _) if id in af:
+                return Assign([Subscript(Name(id), Constant(0), Store())],
+                              self.box_exp(rhs, af))
+            case AnnAssign(target, annotation, rhs, simple):
+                return AnnAssign(target, annotation,
+                                 self.box_exp(rhs, af), simple)
+            case Expr(value):
+                return Expr(self.box_exp(value, af))
+            case Return(value):
+                return Return(self.box_exp(value, af))
+            case If(test, thn, els):
+                return If(self.box_exp(test, af),
+                          self.box_stmts(thn, af), self.box_stmts(els, af))
+            case While(test, body, []):
+                return While(self.box_exp(test, af), self.box_stmts(body, af), [])
+            case Pass():
+                return s
+            case _:
+                raise Exception('error in box_stmt, unexpected ' + repr(s))
+
+    def box_stmts(self, ss: list[stmt], af: set[str]) -> list[stmt]:
+        return [self.box_stmt(s, af) for s in ss]
+
+    def box_variable(self, name: str, ty: Type,
+                     fresh_name: typing.Optional[str] = None) -> stmt:
+        """Create the box that holds the assigned variable `name`.
+
+        A boxed local starts with an uninitialized element; a boxed parameter
+        is renamed to `fresh_name` and its box starts with that value.  The
+        box is a length-one tuple, so reads and writes are its element 0.
+        """
+        contents: expr = Uninitialized(ty)
+        if fresh_name is not None:
+            contents = Name(fresh_name)
+        box = Tuple([contents], Load())
+        box.has_type = TupleType([ty])
+        return Assign([Name(name)], box)
+
+    def convert_assignments_def(self, f: FunctionDef) -> FunctionDef:
+        if isinstance(f.args, ast.arguments):
+            raise Exception('convert_assignments: run the type checker '
+                            'before convert_assignments')
+        af = self.free_in_lambda_stmts(f.body) & self.assigned_vars_stmts(f.body)
+        types = self.binding_types(f)
+        fresh_params: dict[str, str] = {}
+        params: list[tuple[str, Type]] = []
+        for (name, ty) in f.args:
+            if name in af:
+                fresh = generate_name(name)
+                fresh_params[name] = fresh
+                params.append((fresh, ty))
+            else:
+                params.append((name, ty))
+        boxes: list[stmt] = []
+        for name in sorted(af):
+            ty = types.get(name)
+            if ty is None:
+                raise Exception('convert_assignments: missing type for ' + name)
+            boxes.append(self.box_variable(name, ty, fresh_params.get(name)))
+        body = boxes + self.box_stmts(f.body, af)
+        return FunctionDef(f.name, params, body, None, f.returns, None)
+
+    def convert_assignments(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                defs: list[stmt] = []
+                for s in body:
+                    match s:
+                        case FunctionDef(_, _, _, _, _, _):
+                            defs.append(self.convert_assignments_def(s))
+                        case _:
+                            raise Exception('error in convert_assignments, '
+                                            'unexpected ' + repr(s))
+                return Module(defs)
+            case _:
+                raise Exception('error in convert_assignments, unexpected '
+                                + repr(p))
+
+    ############################################################################
     #  Limit Functions
     ############################################################################
     #  The x86-64 calling convention passes at most six arguments in
