@@ -27,7 +27,7 @@ typecheck_dict = {
     'convert_assignments': type_check_Llambda,
     'convert_to_closures': type_check_Llambda,
     'limit_functions': type_check_Llambda,
-#   'expose_allocation': type_check_Llambda,
+    'expose_allocation': type_check_Llambda,
 #   'remove_complex_operands': type_check_Llambda,
 #   'explicate_control': type_check_Llambda,
 }
@@ -41,7 +41,7 @@ interp_dict = {
     'convert_assignments': interp_Llambda,
     'convert_to_closures': interp_Llambda,
     'limit_functions': interp_Llambda,
-#   'expose_allocation': interp_Llambda,
+    'expose_allocation': interp_Llambda,
 #   'remove_complex_operands': interp_Llambda,
 #   'explicate_control': interp_Llambda,
 #   'select_instructions': interp_x86,

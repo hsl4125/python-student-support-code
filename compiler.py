@@ -1696,6 +1696,34 @@ class Compiler:
     # bytes per element.  The initializers are evaluated (into temporaries)
     # before the allocation because a tuple may trigger the garbage collector,
     # and the collector must never observe an allocated but uninitialized tuple.
+    #
+    # Closure creation (section 9.6) uses the same protocol with one extra
+    # step.  A flat closure is a tuple whose element 0 is the code pointer and
+    # whose remaining elements are the values of the free variables:
+    #
+    #   closure{arity}(e0, ..., em)  ==>  unchecked_cast(
+    #                                       begin
+    #                                         init.0 = e0'
+    #                                         ...
+    #                                         init.m = em'
+    #                                         if global_value(free_ptr) + bytes < global_value(fromspace_end):
+    #                                         else:
+    #                                             collect(bytes)
+    #                                         alloc.k = alloc_clos(m+1, has_type, arity)
+    #                                         alloc.k[0] = init.0
+    #                                         ...
+    #                                         alloc.k[m] = init.m
+    #                                         alloc.k
+    #                                       end,
+    #                                       erased_type)
+    #
+    # The allocation record carries the closure's arity, which select
+    # instructions stores in bits 57-61 of the tuple tag.  Its type is the
+    # full tuple type has_type so that select can compute the pointer mask
+    # for the collector (element 0 is a code pointer, not a heap pointer).
+    # The unchecked cast restores the static closure type erased_type, a
+    # one-element tuple type: the types of the captured values do not appear
+    # in the type of a closure (section 9.5).
     def expose_alloc_exp(self, e: expr) -> expr:
         match  e:
             case UnaryOp(op, operand):
@@ -1764,14 +1792,54 @@ class Compiler:
                     stmts.append(Assign([Subscript(Name(alloc), Constant(index), Store())],
                                         Name(name)))
                 return Begin(stmts, Name(alloc))
+            case Closure(arity, args):
+                if not hasattr(e, 'has_type') or not hasattr(e, 'erased_type'):
+                    raise ValueError('expose_alloc_exp: closure is missing type '
+                                     'information; run the type checker before '
+                                     'expose_allocation')
+                if arity > 31:
+                    raise ValueError('expose_alloc_exp: closure arity ' + str(arity)
+                                     + ' does not fit in the five bits of the tag')
+                # 1. Evaluate the code pointer and the free variables into
+                #    temporaries, left to right.
+                init_names = []
+                stmts: list[stmt] = []
+                for arg in args:
+                    name = generate_name('init')
+                    init_names.append(name)
+                    stmts.append(Assign([Name(name)], self.expose_alloc_exp(arg)))
+                # 2. Collect only when there is not enough room in the from-space.
+                bytes = 8 * (len(args) + 1)
+                cond = Compare(BinOp(GlobalValue('free_ptr'), Add(), Constant(bytes)),
+                               [Lt()], [GlobalValue('fromspace_end')])
+                stmts.append(If(cond, [], [Collect(bytes)]))
+                # 3. Allocate the closure tuple and initialize its elements.
+                #    The length is the physical length (code pointer plus the
+                #    free variables), while the type is the full tuple type that
+                #    select needs for the pointer mask.
+                alloc = generate_name('alloc')
+                stmts.append(Assign([Name(alloc)],
+                                    AllocateClosure(len(args), e.has_type, arity)))
+                for index, name in enumerate(init_names):
+                    stmts.append(Assign([Subscript(Name(alloc), Constant(index), Store())],
+                                        Name(name)))
+                # 4. Restore the static type of the closure, a one-element
+                #    tuple type in which the captured values' types do not occur.
+                return UncheckedCast(Begin(stmts, Name(alloc)), e.erased_type)
             case Subscript(exp, Constant(index), Load()):
                 return Subscript(self.expose_alloc_exp(exp), Constant(index), Load())
             case Constant(_) | Name(_) | GlobalValue(_) | FunRef(_, _) \
-                    | Allocate(_, _):
+                    | Allocate(_, _) | Uninitialized(_):
                 # FunRef is an atom here: section 8.6 turns it into a
                 # temporary assignment, and select_instructions compiles that
                 # assignment into a leaq.
+                # Uninitialized is an atom too: boxing leaves a slot of a known
+                # type without a value, and it is overwritten before any read.
                 return e
+            case UncheckedCast(exp, ty):
+                # Defensive: the input of this pass should not contain casts,
+                # but keeping the branch makes the pass idempotent.
+                return UncheckedCast(self.expose_alloc_exp(exp), ty)
             case _:
                 raise Exception('error in expose_alloc_exp, unexpected ' + repr(e))
 
