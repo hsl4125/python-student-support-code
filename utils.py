@@ -1371,6 +1371,18 @@ def compile_and_test(compiler, compiler_name,
             test_pass(passname, interp_dict, program_root, program,
                       compiler_name)
 
+    passname = 'optimize_known_calls'
+    if passname in interp_dict and hasattr(compiler, passname):
+        trace('\n# ' + passname + '\n')
+        program = compiler.optimize_known_calls(program)
+        trace(program)
+        if passname in type_check_dict.keys():
+            type_check_dict[passname](program)
+        total_passes += 1
+        successful_passes += \
+            test_pass(passname, interp_dict, program_root, program,
+                      compiler_name)
+
     passname = 'limit_functions'
     if passname in interp_dict and hasattr(compiler, passname):
         trace('\n# ' + passname + '\n')
@@ -1573,6 +1585,12 @@ def compile(compiler, compiler_name, type_check_L, type_check_C,
         trace('\n# closure conversion\n')
         type_check_L(program)
         program = compiler.convert_to_closures(program)
+        trace_ast_and_concrete(program)
+
+    if hasattr(compiler, 'optimize_known_calls'):
+        trace('\n# optimize known calls\n')
+        type_check_L(program)
+        program = compiler.optimize_known_calls(program)
         trace_ast_and_concrete(program)
 
     if hasattr(compiler, 'limit_functions'):

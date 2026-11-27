@@ -476,7 +476,13 @@ class X86Emulator:
                 # A tail call: run the callee and then return from the
                 # current function, leaving the result in %rax.  The actual
                 # frame popping is the job of a later pass (section 8.10).
-                v = self.eval_arg(instr.children[0])
+                operand = instr.children[0]
+                if getattr(operand, 'data', None) == 'global_val_a':
+                    # A direct tail call targets a code label rather than a
+                    # function pointer (section 9.9).
+                    self.call_function(str(operand.children[0]), blocks, output)
+                    return
+                v = self.eval_arg(operand)
                 assert isinstance(v, FunPointer)
                 self.call_function(v.fun_name, blocks, output)
                 return

@@ -48,6 +48,11 @@ def create_block(promise: Code, basic_blocks: dict[str, list[stmt]]) -> Promise:
 
 class Compiler:
 
+    def __init__(self) -> None:
+        # Names of top-level functions that are used as values and
+        # therefore need a closure representation (section 9.9).
+        self.escaping: set[str] = set()
+
     ############################################################################
     #  Partial Evaluator
     ############################################################################
@@ -1153,6 +1158,12 @@ class Compiler:
             case Call(Name(f), args) if f in builtin_functions:
                 return Call(Name(f), [self.convert_to_closures_exp(a, new_defs)
                                       for a in args])
+            case Call(FunRef(name, arity), args) if name not in self.escaping:
+                # A function that is never used as a value keeps its label;
+                # calling it needs no closure at all (section 9.9).
+                return Call(FunRef(name, arity),
+                            [self.convert_to_closures_exp(a, new_defs)
+                             for a in args])
             case Call(func, args):
                 tmp = generate_name('tmp')
                 func2 = self.convert_to_closures_exp(func, new_defs)
@@ -1163,6 +1174,9 @@ class Compiler:
                     Call(Subscript(Name(tmp), Constant(0), Load()),
                          [Name(tmp)] + args2))
             case FunRef(id, arity):
+                if id not in self.escaping:
+                    # Only ever used as a direct callee, so it stays a label.
+                    return FunRef(id, arity)
                 return Closure(arity, [FunRef(id, arity)])
             case Name(_) | Constant(_) | Uninitialized(_) | GlobalValue(_) | \
                     Allocate(_, _) | AllocateArray(_, _) | AllocateClosure(_, _, _):
@@ -1249,7 +1263,9 @@ class Compiler:
                 new_params: list[tuple[str, Type]] = []
                 # main is the entry point and is never used as a value, so it
                 # does not receive a closure parameter (section 9.5).
-                if name != 'main':
+                if name != 'main' and name in self.escaping:
+                    # Escaping functions receive their closure as the first
+                    # argument; direct-call-only functions do not.
                     new_params.append((generate_name('clos'),
                                        TupleType([Bottom()])))
                 for (p, ty) in params:
@@ -1261,9 +1277,97 @@ class Compiler:
                 raise Exception('error in convert_to_closures_def, unexpected '
                                 + repr(f))
 
+    def escaping_functions(self, p: Module) -> set[str]:
+        """Collect the top-level functions that are used as values.
+
+        A function is *escaping* when its name occurs anywhere except as
+        the callee of a direct call.  Escaping functions need a closure
+        representation; the others can be called by label directly
+        (section 9.9, exercise 9.2).
+        """
+        escaped: set[str] = set()
+
+        def visit_exp(e: expr) -> None:
+            match e:
+                case FunRef(name, _):
+                    escaped.add(name)
+                case Lambda(_, body):
+                    visit_exp(body)
+                case Call(FunRef(_, _), args):
+                    # The callee position of a direct call does not count
+                    # as an escape; the arguments still do.
+                    for a in args:
+                        visit_exp(a)
+                case Call(func, args):
+                    visit_exp(func)
+                    for a in args:
+                        visit_exp(a)
+                case UnaryOp(_, operand):
+                    visit_exp(operand)
+                case BinOp(left, _, right):
+                    visit_exp(left)
+                    visit_exp(right)
+                case Compare(left, _, comparators):
+                    visit_exp(left)
+                    for c in comparators:
+                        visit_exp(c)
+                case IfExp(test, body, orelse):
+                    visit_exp(test)
+                    visit_exp(body)
+                    visit_exp(orelse)
+                case Tuple(elts, Load()) | List(elts, Load()):
+                    for x in elts:
+                        visit_exp(x)
+                case Subscript(base, index, Load()):
+                    visit_exp(base)
+                    visit_exp(index)
+                case Begin(body, result):
+                    for s in body:
+                        visit_stmt(s)
+                    visit_exp(result)
+                case _:
+                    pass
+
+        def visit_stmt(s: stmt) -> None:
+            match s:
+                case Expr(value):
+                    visit_exp(value)
+                case Assign([Name(_)], rhs):
+                    visit_exp(rhs)
+                case Assign([Subscript(base, index, Store())], value):
+                    visit_exp(base)
+                    visit_exp(index)
+                    visit_exp(value)
+                case AnnAssign(_, _, rhs, _):
+                    visit_exp(rhs)
+                case If(test, thn, els):
+                    visit_exp(test)
+                    for x in thn:
+                        visit_stmt(x)
+                    for x in els:
+                        visit_stmt(x)
+                case While(test, body, []):
+                    visit_exp(test)
+                    for x in body:
+                        visit_stmt(x)
+                case Return(value):
+                    visit_exp(value)
+                case FunctionDef(_, _, bodys, _, _, _):
+                    for x in bodys:
+                        visit_stmt(x)
+                case _:
+                    pass
+
+        match p:
+            case Module(body):
+                for s in body:
+                    visit_stmt(s)
+        return escaped
+
     def convert_to_closures(self, p: Module) -> Module:
         match p:
             case Module(body):
+                self.escaping = self.escaping_functions(p)
                 new_defs: list[stmt] = []
                 defs: list[stmt] = []
                 for s in body:
@@ -1277,6 +1381,243 @@ class Compiler:
                 return Module(defs + new_defs)
             case _:
                 raise Exception('error in convert_to_closures, unexpected '
+                                + repr(p))
+
+    ############################################################################
+    #  Optimize Known Calls
+    ############################################################################
+    #  Section 9.9 (exercise 9.3).  A closure call is indirect: it loads
+    #  the function pointer from element 0 of the closure tuple and then
+    #  performs an indirect call.  When a local variable was most
+    #  recently assigned a closure created from a known top-level
+    #  function, we can call the function label directly instead and pass
+    #  the closure itself as the first argument (the callee still unpacks
+    #  its free variables from that closure).
+    #
+    #  We track the variable -> (function, arity, closure parameter type)
+    #  mapping in a flow-sensitive environment.  Anything that makes the
+    #  tracking unsound (an assignment to the variable, function entry, or
+    #  a control-flow join that disagrees) simply forgets the variable;
+    #  it is always safe not to optimize a call.
+    #
+    #  pseudocode:
+    #    optimize_exp(e, env):
+    #        Call(Name(x), es) with env[x] = (f, n, clos_ty) ->
+    #            Call(FunRef(f, n + 1),
+    #                 [UncheckedCast(Name(x), clos_ty)] + es')
+    #        otherwise recurse over the subexpressions
+    #
+    #    optimize_stmt(s, env):
+    #        Assign([Name(x)], Closure(n, [FunRef(f, k)] + fvs)) ->
+    #            env[x] = (f, k, type of clos parameter of f)
+    #        Assign([Name(x)], rhs) -> forget x, rewrite rhs
+    #        If: rewrite both branches with copies of env, then keep the
+    #            entries both branches agree on
+    #        While: rewrite the body with a copy of env, then forget every
+    #            variable assigned in the body
+    #        other statements: recurse
+    #
+    def closure_param_types(self, p: Module) -> dict[str, Type]:
+        """Map each function name to the type of its closure parameter.
+
+        Only functions that escaped closure conversion have a closure
+        parameter; a closure literal always refers to one of those
+        functions, so this table is enough to recover the parameter type
+        that the direct call has to pass.
+        """
+        types: dict[str, Type] = {}
+        match p:
+            case Module(body):
+                for s in body:
+                    match s:
+                        case FunctionDef(name, params, _, _, _, _) if params:
+                            types[name] = params[0][1]
+                        case _:
+                            pass
+        return types
+
+    def optimize_known_calls_exp(
+        self,
+        e: expr,
+        env: dict[str, typing.Tuple[str, int, Type]],
+        clos_types: dict[str, Type],
+    ) -> expr:
+        match e:
+            case Begin([Assign([Name(tmp)], Name(id))],
+                       Call(Subscript(Name(tmp2), Constant(0), Load()),
+                            call_args)) \
+                    if tmp == tmp2 and call_args \
+                    and isinstance(call_args[0], Name) \
+                    and call_args[0].id == tmp and id in env:
+                # convert_to_closures turned every closure application into
+                # Begin([tmp = f], (tmp[0])(tmp, args)).  When f is a known
+                # closure, skip the indirect call: the closure itself is
+                # passed as the first argument of the direct call.
+                (fname, arity, clos_ty) = env[id]
+                return Call(
+                    FunRef(fname, arity + 1),
+                    [UncheckedCast(Name(id), clos_ty)] +
+                    [self.optimize_known_calls_exp(a, env, clos_types)
+                     for a in call_args[1:]])
+            case Call(Name(id), args) if id in env:
+                (fname, arity, clos_ty) = env[id]
+                # The closure itself becomes the first argument; the
+                # callee expects it in front of its own parameters.
+                return Call(
+                    FunRef(fname, arity + 1),
+                    [UncheckedCast(Name(id), clos_ty)] +
+                    [self.optimize_known_calls_exp(a, env, clos_types)
+                     for a in args])
+            case Call(func, args):
+                return Call(
+                    self.optimize_known_calls_exp(func, env, clos_types),
+                    [self.optimize_known_calls_exp(a, env, clos_types)
+                     for a in args])
+            case Closure(arity, args):
+                return Closure(
+                    arity,
+                    [self.optimize_known_calls_exp(a, env, clos_types)
+                     for a in args])
+            case UnaryOp(op, operand):
+                return UnaryOp(
+                    op, self.optimize_known_calls_exp(operand, env, clos_types))
+            case BinOp(left, op, right):
+                return BinOp(
+                    self.optimize_known_calls_exp(left, env, clos_types), op,
+                    self.optimize_known_calls_exp(right, env, clos_types))
+            case Compare(left, ops, comparators):
+                return Compare(
+                    self.optimize_known_calls_exp(left, env, clos_types), ops,
+                    [self.optimize_known_calls_exp(c, env, clos_types)
+                     for c in comparators])
+            case IfExp(test, body, orelse):
+                return IfExp(
+                    self.optimize_known_calls_exp(test, env, clos_types),
+                    self.optimize_known_calls_exp(body, env, clos_types),
+                    self.optimize_known_calls_exp(orelse, env, clos_types))
+            case Tuple(elts, Load()):
+                return Tuple(
+                    [self.optimize_known_calls_exp(x, env, clos_types)
+                     for x in elts], Load())
+            case List(elts, Load()):
+                return List(
+                    [self.optimize_known_calls_exp(x, env, clos_types)
+                     for x in elts], Load())
+            case Subscript(base, index, Load()):
+                return Subscript(
+                    self.optimize_known_calls_exp(base, env, clos_types),
+                    self.optimize_known_calls_exp(index, env, clos_types),
+                    Load())
+            case Begin(body, result):
+                new_body = [
+                    self.optimize_known_calls_stmt(x, env, clos_types)
+                    for x in body]
+                return Begin(
+                    new_body,
+                    self.optimize_known_calls_exp(result, env, clos_types))
+            case Name(_) | Constant(_) | Uninitialized(_) | GlobalValue(_) | \
+                    FunRef(_, _) | Allocate(_, _) | AllocateArray(_, _) | \
+                    AllocateClosure(_, _, _):
+                return e
+            case _:
+                raise Exception('error in optimize_known_calls_exp, '
+                                'unexpected ' + repr(e))
+
+    def optimize_known_calls_stmt(
+        self,
+        s: stmt,
+        env: dict[str, typing.Tuple[str, int, Type]],
+        clos_types: dict[str, Type],
+    ) -> stmt:
+        match s:
+            case Assign([Name(id)], Closure(arity, cargs)):
+                rhs2 = self.optimize_known_calls_exp(s.value, env, clos_types)
+                # A closure literal starts with the reference to the
+                # hoisted (or escaping) function definition.
+                if cargs and isinstance(cargs[0], FunRef) \
+                        and cargs[0].name in clos_types:
+                    env[id] = (cargs[0].name, cargs[0].arity,
+                               clos_types[cargs[0].name])
+                else:
+                    env.pop(id, None)
+                return Assign([Name(id)], rhs2)
+            case Assign([Name(id)], rhs):
+                env.pop(id, None)
+                return Assign(
+                    [Name(id)],
+                    self.optimize_known_calls_exp(rhs, env, clos_types))
+            case Assign([Subscript(base, index, Store())], value):
+                # Writing through a box invalidates what we knew about
+                # the box's owner variable.
+                match base:
+                    case Name(id):
+                        env.pop(id, None)
+                    case _:
+                        pass
+                return Assign(
+                    [Subscript(
+                        self.optimize_known_calls_exp(base, env, clos_types),
+                        self.optimize_known_calls_exp(index, env, clos_types),
+                        Store())],
+                    self.optimize_known_calls_exp(value, env, clos_types))
+            case Expr(value):
+                return Expr(
+                    self.optimize_known_calls_exp(value, env, clos_types))
+            case If(test, thn, els):
+                test2 = self.optimize_known_calls_exp(test, env, clos_types)
+                thn_env = dict(env)
+                thn2 = [self.optimize_known_calls_stmt(x, thn_env, clos_types)
+                        for x in thn]
+                els_env = dict(env)
+                els2 = [self.optimize_known_calls_stmt(x, els_env, clos_types)
+                        for x in els]
+                # A variable is known after the join only if both branches
+                # still agree about it.
+                env.clear()
+                env.update({k: v for (k, v) in thn_env.items()
+                            if els_env.get(k) == v})
+                return If(test2, thn2, els2)
+            case While(test, body, []):
+                test2 = self.optimize_known_calls_exp(test, env, clos_types)
+                body_env = dict(env)
+                body2 = [self.optimize_known_calls_stmt(x, body_env, clos_types)
+                         for x in body]
+                # The body may run zero or more times, so nothing it
+                # assigns can be assumed known after the loop.
+                for name in self.assigned_vars_stmts(body2):
+                    env.pop(name, None)
+                return While(test2, body2, [])
+            case Return(value):
+                return Return(
+                    self.optimize_known_calls_exp(value, env, clos_types))
+            case Pass():
+                return Pass()
+            case _:
+                raise Exception('error in optimize_known_calls_stmt, '
+                                'unexpected ' + repr(s))
+
+    def optimize_known_calls(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                clos_types = self.closure_param_types(p)
+                new_body: list[stmt] = []
+                for s in body:
+                    match s:
+                        case FunctionDef(name, params, bodys, dl, ret, comment):
+                            env: dict[str, typing.Tuple[str, int, Type]] = {}
+                            new_bodys = [
+                                self.optimize_known_calls_stmt(x, env,
+                                                               clos_types)
+                                for x in bodys]
+                            new_body.append(
+                                FunctionDef(name, params, new_bodys, dl, ret,
+                                            comment))
+                        case _:
+                            raise Exception('error in optimize_known_calls, '
+                                            'unexpected ' + repr(s))
+                return Module(new_body)
+            case _:
+                raise Exception('error in optimize_known_calls, unexpected '
                                 + repr(p))
 
     ############################################################################
@@ -1315,6 +1656,10 @@ class Compiler:
             case Name(id) if id in env:
                 (tup, index) = env[id]
                 return Subscript(Name(tup), Constant(index), Load())
+            case UncheckedCast(exp, ty):
+                # A cast of a packed parameter keeps its (already
+                # translated) type but the operand may need limiting.
+                return UncheckedCast(self.limit_exp(exp, env), ty)
             case Call(func, args):
                 new_func = self.limit_exp(func, env)
                 new_args = [self.limit_exp(arg, env) for arg in args]
@@ -1322,6 +1667,11 @@ class Compiler:
                 # passes at most six arguments.
                 if len(new_args) > 6:
                     new_args = new_args[:5] + [Tuple(new_args[5:], Load())]
+                    if isinstance(new_func, FunRef):
+                        # The packed call passes six arguments; keep the
+                        # arity recorded in the function reference equal to
+                        # the number of arguments actually passed.
+                        new_func = FunRef(new_func.name, len(new_args))
                 return Call(new_func, new_args)
             case UnaryOp(op, operand):
                 return UnaryOp(op, self.limit_exp(operand, env))
@@ -2003,6 +2353,18 @@ class Compiler:
                     arr_bindings + index_bindings + value_bindings)
             case Call(Name('exit'), []) as call:
                 return finish_rco(call, [])
+            case Call(FunRef(label, arity), args):
+                # A direct call of a known function (section 9.9): the label
+                # is not an operand, so no function address has to be
+                # materialized; only the arguments must be atomic.
+                bindings: Temporaries = []
+                reduced_args = []
+                for arg in args:
+                    (arg_expr, arg_bindings) = self.rco_exp(arg, True)
+                    reduced_args.append(arg_expr)
+                    bindings += arg_bindings
+                return finish_rco(Call(FunRef(label, arity), reduced_args),
+                                  bindings)
             case Call(func, args):
                 # A call is a complex operand: it expands to a sequence of
                 # instructions, so an atom position binds it to a temporary.
@@ -2723,6 +3085,15 @@ class Compiler:
                 # leaq computes that address without touching memory
                 # (section 8.8).
                 return [Instr('leaq', [Global(label), target])]
+            case Call(FunRef(label, arity), args):
+                # A direct call of a known function (section 9.9): call the
+                # code label itself instead of loading the first element of a
+                # closure and using an indirect call.
+                instrs = self.select_arguments(args)
+                instrs.append(Callq(label, len(args)))
+                if target != Reg('rax'):
+                    instrs.append(Instr('movq', [Reg('rax'), target]))
+                return instrs
             case Call(func, args):
                 # A call of a user-defined function goes through the
                 # function's address, so it is an indirect call.
@@ -2758,6 +3129,13 @@ class Compiler:
                 return self.select_assign_into(Reg('rax'), value) + [
                     Jump(conclusion)
                 ]
+            case TailCall(FunRef(label, arity), args):
+                # A direct tail call of a known function (section 9.9): the
+                # label is used as the jump target, so no function pointer
+                # has to be loaded into a register.
+                instrs = self.select_arguments(args)
+                instrs.append(TailJump(Global(label), len(args)))
+                return instrs
             case TailCall(func, args):
                 # Pass the arguments, then pop the frame and jump.  The
                 # frame size is not known until register allocation, so we
@@ -3088,7 +3466,24 @@ class Compiler:
                         for v in lafter:
                             if v not in (src, d):
                                 add_edge(d, v)
-                case Callq('collect', _) | IndirectCallq(_, _) | TailJump(_, _):
+                case Callq(f, _) if f not in ('print_int', 'read_int',
+                                              'initialize', 'collect',
+                                              'exit'):
+                    # A direct call of a user-defined function can allocate
+                    # and therefore call collect, so it obeys the same GC
+                    # rule as an indirect call (section 9.9).
+                    for d in w:
+                        for v in lafter:
+                            if d != v:
+                                add_edge(d, v)
+                    for v in lafter:
+                        if (isinstance(v, Variable)
+                                and isinstance(types.get(v.id),
+                                               (TupleType, ListType))):
+                            for r in [Reg('rbx'), Reg('r12'),
+                                      Reg('r13'), Reg('r14')]:
+                                add_edge(v, r)
+                case Callq(_, _) | IndirectCallq(_, _) | TailJump(_, _):
                     # The usual rule: the call writes the caller-saved
                     # registers, so they conflict with everything live after.
                     for d in w:
@@ -3532,6 +3927,10 @@ class Compiler:
             # register.  Expanding the tail call (section 8.11) pops the frame
             # and restores the callee-saved registers, which tramples every
             # other register before the jump.
+            case TailJump(Global(_), _):
+                # A direct tail jump targets a code label, not a function
+                # pointer, so it must not be forced into %rax (section 9.9).
+                instrs.append(i)
             case TailJump(func, arity) if not (isinstance(func, Reg)
                                                and func.id == 'rax'):
                 instrs.append(Instr('movq', [func, Reg('rax')]))
@@ -3659,11 +4058,16 @@ class Compiler:
             result = []
             for i in instrs:
                 if isinstance(i, TailJump):
-                    # Epilogue of the current function, then an indirect jump
-                    # to the callee (8.10 guaranteed the target is %rax).
+                    # Epilogue of the current function, then a jump to the
+                    # callee.  A direct tail call jumps to a code label; an
+                    # indirect one goes through the function pointer that
+                    # 8.10 guaranteed is in %rax.
                     result.extend(conclusion(d.stack_size, d.used_callee,
                                              d.root_stack_size, ret=False))
-                    result.append(IndirectJump(i.func))
+                    if isinstance(i.func, Global):
+                        result.append(Jump(i.func.name))
+                    else:
+                        result.append(IndirectJump(i.func))
                 else:
                     result.append(i)
             return result
