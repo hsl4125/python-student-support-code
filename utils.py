@@ -758,6 +758,9 @@ class UncheckedCast(expr):
     ty: Type
     __match_args__ = ("exp","ty")
 
+    def __str__(self):
+        return '(' + str(self.exp) + ' : _ => ' + str(self.ty) + ')'
+
 @dataclass
 class Collect(stmt):
     size: int
@@ -1204,6 +1207,20 @@ def compile_and_test(compiler, compiler_name,
     trace('')
     trace(repr(program))
     trace('')
+
+    # A test with a .tyerr file (contents ignored) must be rejected by
+    # the source type checker, as in the Racket support code.
+    if os.path.isfile(program_root + '.tyerr'):
+        test_name = os.path.basename(program_root)
+        try:
+            type_check_dict['source'](program)
+        except Exception as e:
+            trace('expected type error: ' + str(e))
+            print('compiler ' + compiler_name + ' passed test ' + test_name)
+            return (0, 0, 1)
+        print('compiler ' + compiler_name + ', expected type error'
+              + ' on test ' + test_name)
+        return (0, 0, 0)
 
     if 'source' in type_check_dict.keys():
         trace('\n# type checking source program\n')
