@@ -420,8 +420,11 @@ class Compiler:
     def _param_names(self, params) -> list[str]:
         # The source-language type checker normalizes parameters into a list
         # of (name, type) pairs, but keep the raw ast.arguments form usable.
+        # Lambda parameters are already plain names (list[str]).
         if isinstance(params, ast.arguments):
             return [p.arg for p in params.args]
+        if params and isinstance(params[0], str):
+            return list(params)
         return [p[0] for p in params]
 
     def reveal_exp(self, e: expr, env: dict[str, int]) -> expr:
@@ -430,6 +433,12 @@ class Compiler:
                 return FunRef(id, env[id])
             case Name(_) | Constant(_) | GlobalValue(_) | FunRef(_, _) | Allocate(_, _):
                 return e
+            case Lambda(params, body):
+                # A lambda parameter shadows a function of the same name.
+                new_env = dict(env)
+                for p in self._param_names(params):
+                    new_env.pop(p, None)
+                return Lambda(params, self.reveal_exp(body, new_env))
             case Call(func, args):
                 return Call(self.reveal_exp(func, env),
                             [self.reveal_exp(a, env) for a in args])
@@ -483,6 +492,18 @@ class Compiler:
                 return Assign([Subscript(self.reveal_exp(base, env),
                                          self.reveal_exp(index, env), Store())],
                               self.reveal_exp(value, env))
+            case AnnAssign(target, annotation, rhs, simple):
+                # Convert the right-hand side before shadowing the name so
+                # that `f : Callable[[int], int] = inc` still turns inc into
+                # a FunRef.  An annotated assignment always binds the name.
+                rhs2 = self.reveal_exp(rhs, env)
+                match target:
+                    case Name(id):
+                        env.pop(id, None)
+                        return AnnAssign(Name(id), annotation, rhs2, simple)
+                    case _:
+                        raise Exception('error in reveal_stmt, unexpected '
+                                        + repr(s))
             case If(test, thn, els):
                 return If(self.reveal_exp(test, env),
                           self.reveal_stmts(thn, env),
