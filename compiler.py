@@ -907,6 +907,356 @@ class Compiler:
                                 + repr(p))
 
     ############################################################################
+    #  Convert to Closures
+    ############################################################################
+    #  Lexically scoped functions have to become top-level function
+    #  definitions plus flat closures: every function value is represented
+    #  at run time as a tuple whose element 0 is a function pointer and
+    #  whose remaining elements are the values of the lambda's free
+    #  variables (section 9.5).
+    #
+    #  The pass comes after reveal_functions (so function references are
+    #  FunRefs) and after convert_assignments (so assigned free variables
+    #  are boxes), and before limit_functions (application gains a closure
+    #  argument).
+    #
+    #  pseudocode:
+    #    translate_type(T):
+    #        FunctionType([T1..Tn], Tr) ->
+    #            TupleType([FunctionType([TupleType([]), T1'..Tn'], Tr')])
+    #        TupleType/ListType: translate the element types
+    #        other types: unchanged
+    #
+    #    convert_exp(e):
+    #        Lambda([x1..xn], body) ->
+    #            hoist def name(clos, x1, .., xn) =
+    #                fvs1 = clos[1]; ...; fvsm = clos[m]; return body'
+    #            Closure(n, [FunRef(name, n), fvs1, .., fvsm])
+    #        Call(f, es) with f not primitive ->
+    #            Begin([Assign([tmp], f')],
+    #                  (f'[0])(tmp, es'))
+    #        FunRef(f, n) -> Closure(n, [FunRef(f, n)])
+    #        AnnAssign(x, T, e) -> Assign([x], e')
+    #        other expressions: recurse over the subexpressions
+    #
+    #    convert_def(f):
+    #        add a closure parameter (except for main), translate the
+    #        annotations, and convert the body
+    #
+    #    convert_to_closures(p):
+    #        convert every function definition and append the hoisted
+    #        lambda definitions to the module
+    #
+    def translate_type(self, ty: Type) -> Type:
+        """Translate a type annotation (section 9.5).
+
+        Function types become a one-element tuple type whose element is
+        the function, and the function takes a closure (typed as the
+        empty tuple) as its first parameter.
+        """
+        match ty:
+            case FunctionType(param_types, ret_type):
+                return TupleType([FunctionType(
+                    [TupleType([])] + [self.translate_type(t)
+                                       for t in param_types],
+                    self.translate_type(ret_type))])
+            case TupleType(types):
+                return TupleType([self.translate_type(t) for t in types])
+            case ListType(elt_ty):
+                return ListType(self.translate_type(elt_ty))
+            case Bottom():
+                return Bottom()
+            case _:
+                return ty
+
+    def merge_var_types(self, d1: dict[str, Type],
+                        d2: dict[str, Type]) -> dict[str, Type]:
+        result = dict(d1)
+        for (name, ty) in d2.items():
+            if name in result:
+                if result[name] != ty:
+                    raise Exception('convert_to_closures: conflicting types for '
+                                    + name)
+            else:
+                result[name] = ty
+        return result
+
+    def free_var_types(self, e: expr) -> dict[str, Type]:
+        """The free variables of e together with their types.
+
+        Lambda parameters are binders; a nested lambda contributes its
+        own free variables, because those are visible in the enclosing
+        function where the closure is created.
+        """
+        match e:
+            case Name(id):
+                if not hasattr(e, 'has_type'):
+                    raise Exception('convert_to_closures: missing type for '
+                                    + id + '; run the type checker first')
+                return {id: e.has_type}
+            case Constant(_) | Uninitialized(_) | FunRef(_, _) | GlobalValue(_):
+                return {}
+            case Lambda(params, body):
+                result = self.free_var_types(body)
+                for p in self._param_names(params):
+                    result.pop(p, None)
+                return result
+            case Call(Name(f), args) if f in builtin_functions:
+                result: dict[str, Type] = {}
+                for a in args:
+                    result = self.merge_var_types(result,
+                                                  self.free_var_types(a))
+                return result
+            case Call(func, args):
+                result = self.free_var_types(func)
+                for a in args:
+                    result = self.merge_var_types(result,
+                                                  self.free_var_types(a))
+                return result
+            case BoolOp(_, values):
+                result = dict()
+                for v in values:
+                    result = self.merge_var_types(result,
+                                                  self.free_var_types(v))
+                return result
+            case UnaryOp(_, operand):
+                return self.free_var_types(operand)
+            case BinOp(left, _, right):
+                return self.merge_var_types(self.free_var_types(left),
+                                            self.free_var_types(right))
+            case Compare(left, _, comparators):
+                result = self.free_var_types(left)
+                for c in comparators:
+                    result = self.merge_var_types(result,
+                                                  self.free_var_types(c))
+                return result
+            case IfExp(test, thn, els):
+                return self.merge_var_types(
+                    self.free_var_types(test),
+                    self.merge_var_types(self.free_var_types(thn),
+                                         self.free_var_types(els)))
+            case Tuple(es, Load()) | List(es, Load()):
+                result = dict()
+                for x in es:
+                    result = self.merge_var_types(result,
+                                                  self.free_var_types(x))
+                return result
+            case Subscript(base, index, Load()):
+                return self.merge_var_types(self.free_var_types(base),
+                                            self.free_var_types(index))
+            case Begin(body, result):
+                types = dict()
+                for s in body:
+                    types = self.merge_var_types(types,
+                                                 self.free_var_types_stmt(s))
+                return self.merge_var_types(types,
+                                            self.free_var_types(result))
+            case _:
+                raise Exception('error in free_var_types, unexpected '
+                                + repr(e))
+
+    def free_var_types_stmt(self, s: stmt) -> dict[str, Type]:
+        match s:
+            case Expr(value):
+                return self.free_var_types(value)
+            case Assign([Name(id)], rhs):
+                return self.free_var_types(rhs)
+            case Assign([Subscript(base, index, Store())], value):
+                return self.merge_var_types(
+                    self.merge_var_types(self.free_var_types(base),
+                                         self.free_var_types(index)),
+                    self.free_var_types(value))
+            case AnnAssign(_, _, rhs, _):
+                return self.free_var_types(rhs)
+            case If(test, thn, els):
+                result = self.free_var_types(test)
+                for branch in (thn, els):
+                    for x in branch:
+                        result = self.merge_var_types(result,
+                                                      self.free_var_types_stmt(x))
+                return result
+            case While(test, body, []):
+                result = self.free_var_types(test)
+                for x in body:
+                    result = self.merge_var_types(result,
+                                                  self.free_var_types_stmt(x))
+                return result
+            case Return(value):
+                return self.free_var_types(value)
+            case Pass():
+                return {}
+            case _:
+                raise Exception('error in free_var_types_stmt, unexpected '
+                                + repr(s))
+
+    def convert_to_closures_exp(self, e: expr,
+                                new_defs: list[stmt]) -> expr:
+        match e:
+            case Lambda(params, body):
+                if not hasattr(e, 'has_type'):
+                    raise Exception('convert_to_closures: missing type for '
+                                    'lambda; run the type checker first')
+                ty = e.has_type
+                if not isinstance(ty, FunctionType):
+                    raise Exception('convert_to_closures: expected a function '
+                                    'type for lambda, not ' + repr(ty))
+                pnames = self._param_names(params)
+                types = self.free_var_types(body)
+                for p in pnames:
+                    types.pop(p, None)
+                fvs = sorted(types)
+                name = generate_name('lambda')
+                clos_name = generate_name('clos')
+                clos_ty = TupleType([Bottom()] +
+                                    [self.translate_type(types[f])
+                                     for f in fvs])
+                body2 = self.convert_to_closures_exp(body, new_defs)
+                unpack: list[stmt] = [
+                    Assign([Name(fv)],
+                           Subscript(Name(clos_name), Constant(i + 1), Load()))
+                    for (i, fv) in enumerate(fvs)]
+                new_defs.append(FunctionDef(
+                    name,
+                    [(clos_name, clos_ty)] +
+                    [(p, self.translate_type(t))
+                     for (p, t) in zip(pnames, ty.param_types)],
+                    unpack + [Return(body2)],
+                    None,
+                    self.translate_type(ty.ret_type),
+                    None))
+                return Closure(len(pnames),
+                               [FunRef(name, len(pnames))] +
+                               [Name(fv) for fv in fvs])
+            case Call(Name(f), args) if f in builtin_functions:
+                return Call(Name(f), [self.convert_to_closures_exp(a, new_defs)
+                                      for a in args])
+            case Call(func, args):
+                tmp = generate_name('tmp')
+                func2 = self.convert_to_closures_exp(func, new_defs)
+                args2 = [self.convert_to_closures_exp(a, new_defs)
+                         for a in args]
+                return Begin(
+                    [Assign([Name(tmp)], func2)],
+                    Call(Subscript(Name(tmp), Constant(0), Load()),
+                         [Name(tmp)] + args2))
+            case FunRef(id, arity):
+                return Closure(arity, [FunRef(id, arity)])
+            case Name(_) | Constant(_) | Uninitialized(_) | GlobalValue(_) | \
+                    Allocate(_, _) | AllocateArray(_, _) | AllocateClosure(_, _, _):
+                return e
+            case BoolOp(op, values):
+                return BoolOp(op, [self.convert_to_closures_exp(v, new_defs)
+                                   for v in values])
+            case UnaryOp(op, operand):
+                return UnaryOp(op, self.convert_to_closures_exp(operand,
+                                                                new_defs))
+            case BinOp(left, op, right):
+                return BinOp(self.convert_to_closures_exp(left, new_defs), op,
+                             self.convert_to_closures_exp(right, new_defs))
+            case Compare(left, ops, comparators):
+                return Compare(self.convert_to_closures_exp(left, new_defs),
+                               ops,
+                               [self.convert_to_closures_exp(c, new_defs)
+                                for c in comparators])
+            case IfExp(test, thn, els):
+                return IfExp(self.convert_to_closures_exp(test, new_defs),
+                             self.convert_to_closures_exp(thn, new_defs),
+                             self.convert_to_closures_exp(els, new_defs))
+            case Tuple(es, Load()):
+                return Tuple([self.convert_to_closures_exp(x, new_defs)
+                              for x in es], Load())
+            case List(es, Load()):
+                return List([self.convert_to_closures_exp(x, new_defs)
+                             for x in es], Load())
+            case Subscript(base, index, Load()):
+                return Subscript(self.convert_to_closures_exp(base, new_defs),
+                                 self.convert_to_closures_exp(index, new_defs),
+                                 Load())
+            case Begin(body, result):
+                return Begin(self.convert_to_closures_stmts(body, new_defs),
+                             self.convert_to_closures_exp(result, new_defs))
+            case _:
+                raise Exception('error in convert_to_closures_exp, unexpected '
+                                + repr(e))
+
+    def convert_to_closures_stmts(self, ss: list[stmt],
+                                  new_defs: list[stmt]) -> list[stmt]:
+        return [self.convert_to_closures_stmt(s, new_defs) for s in ss]
+
+    def convert_to_closures_stmt(self, s: stmt,
+                                 new_defs: list[stmt]) -> stmt:
+        match s:
+            case Expr(value):
+                return Expr(self.convert_to_closures_exp(value, new_defs))
+            case Assign([Name(id)], rhs):
+                return Assign([Name(id)],
+                              self.convert_to_closures_exp(rhs, new_defs))
+            case Assign([Subscript(base, index, Store())], value):
+                return Assign(
+                    [Subscript(self.convert_to_closures_exp(base, new_defs),
+                               self.convert_to_closures_exp(index, new_defs),
+                               Store())],
+                    self.convert_to_closures_exp(value, new_defs))
+            case AnnAssign(target, _, rhs, _):
+                return Assign([target],
+                              self.convert_to_closures_exp(rhs, new_defs))
+            case If(test, thn, els):
+                return If(self.convert_to_closures_exp(test, new_defs),
+                          self.convert_to_closures_stmts(thn, new_defs),
+                          self.convert_to_closures_stmts(els, new_defs))
+            case While(test, body, []):
+                return While(self.convert_to_closures_exp(test, new_defs),
+                             self.convert_to_closures_stmts(body, new_defs),
+                             [])
+            case Return(value):
+                return Return(self.convert_to_closures_exp(value, new_defs))
+            case Pass():
+                return Pass()
+            case _:
+                raise Exception('error in convert_to_closures_stmt, unexpected '
+                                + repr(s))
+
+    def convert_to_closures_def(self, f: FunctionDef,
+                                new_defs: list[stmt]) -> FunctionDef:
+        match f:
+            case FunctionDef(name, params, body, _, returns, _):
+                if isinstance(params, ast.arguments):
+                    raise Exception('convert_to_closures: run the type checker '
+                                    'before convert_to_closures')
+                new_params: list[tuple[str, Type]] = []
+                # main is the entry point and is never used as a value, so it
+                # does not receive a closure parameter (section 9.5).
+                if name != 'main':
+                    new_params.append((generate_name('clos'),
+                                       TupleType([Bottom()])))
+                for (p, ty) in params:
+                    new_params.append((p, self.translate_type(ty)))
+                new_body = self.convert_to_closures_stmts(body, new_defs)
+                return FunctionDef(name, new_params, new_body, None,
+                                   self.translate_type(returns), None)
+            case _:
+                raise Exception('error in convert_to_closures_def, unexpected '
+                                + repr(f))
+
+    def convert_to_closures(self, p: Module) -> Module:
+        match p:
+            case Module(body):
+                new_defs: list[stmt] = []
+                defs: list[stmt] = []
+                for s in body:
+                    match s:
+                        case FunctionDef(_, _, _, _, _, _):
+                            defs.append(self.convert_to_closures_def(s,
+                                                                    new_defs))
+                        case _:
+                            raise Exception('error in convert_to_closures, '
+                                            'unexpected ' + repr(s))
+                return Module(defs + new_defs)
+            case _:
+                raise Exception('error in convert_to_closures, unexpected '
+                                + repr(p))
+
+    ############################################################################
     #  Limit Functions
     ############################################################################
     #  The x86-64 calling convention passes at most six arguments in
